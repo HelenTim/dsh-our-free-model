@@ -205,6 +205,20 @@ function isLoopbackIp(ip) {
 }
 
 /**
+ * Resolve the bind address for an operator who explicitly opted into a public
+ * listener. Only IP literals are accepted: a hostname here would reintroduce
+ * the DNS ambiguity `resolveLoopbackBind` exists to remove.
+ *
+ * @returns {string}
+ */
+export function resolvePublicBind(host) {
+  const value = String(host ?? '').trim() || '0.0.0.0'
+  const literal = value.replace(/^\[|\]$/g, '')
+  if (!net.isIP(literal)) throw new Error(`the public listener binds an IP literal only (got ${value})`)
+  return literal
+}
+
+/**
  * Read a failed `listen` into something a settings page can show.
  *
  * `EACCES` is the interesting one. On Windows a port already owned by a
@@ -320,9 +334,10 @@ export async function bindForwardPort(server, { address, port, attempts = BIND_A
  * @param {(event: object) => void} [options.onTrace] - bounded request diagnostics, separate from warnings
  * @param {() => object} [options.health] - 健康应答由各产品入口注入，默认保持插件兼容。
  * @param {(req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>} [options.handleRequest] - 产品附加路由，返回 true 表示已处理。
+ * @param {boolean} [options.bindPublic] - 显式允许绑定非回环地址（独立服务的公网部署）；默认关闭。
  * @returns {Promise<{server: http.Server, port: number, close: () => Promise<void>}>}
  */
-export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest }) {
+export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest, bindPublic = false }) {
   const server = http.createServer((req, res) => {
     const trace = traceRequest(req, res, 'forward', onTrace)
     void handle(req, res, trace).catch(error => {
@@ -391,7 +406,7 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
   // Resolve before listen so a hostile hosts file cannot slip a routable bind
   // past the loopback-only rule. The reported `host` below stays the configured
   // spelling: the settings reconciliation compares it, not the resolved IP.
-  const bindAddress = await resolveLoopbackBind(config().host)
+  const bindAddress = bindPublic ? resolvePublicBind(config().host) : await resolveLoopbackBind(config().host)
   const requestedPort = Number.isFinite(Number(config().port)) ? Math.trunc(Number(config().port)) : 0
   const bound = await bindForwardPort(server, { address: bindAddress, port: requestedPort, log: message => log(`bind: ${message}`) })
   server.on('error', error => log(`listener error: ${error?.message ?? error}`))

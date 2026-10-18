@@ -55,6 +55,21 @@ check('mismatched Origin/Referer authority is refused', () => {
 check('non-http Origin schemes are refused', () => {
   assert.equal(structuralRejection(req({ host: '127.0.0.1:8080', origin: 'file:///etc/passwd' })), 403)
 })
+// The standalone service may opt into a 0.0.0.0 bind behind a TLS-terminating
+// platform proxy. That drops the loopback hostname rule but keeps same-origin,
+// and reads the forwarded scheme so an https Origin matches a scheme-less Host.
+check('an explicit public listener keeps the same-origin fence', () => {
+  const options = { allowPublic: true, trustProxy: true }
+  const publicReq = headers => req({ host: 'ofm.onrender.com', 'x-forwarded-proto': 'https', ...headers })
+  assert.equal(structuralRejection(publicReq({}), options), undefined)
+  assert.equal(structuralRejection(publicReq({ origin: 'https://ofm.onrender.com' }), options), undefined)
+  assert.equal(structuralRejection(publicReq({ referer: 'https://ofm.onrender.com/settings' }), options), undefined)
+  assert.equal(structuralRejection(publicReq({ origin: 'https://evil.example' }), options), 403)
+  assert.equal(structuralRejection(publicReq({ origin: 'http://ofm.onrender.com' }), options), 403)
+  assert.equal(structuralRejection(publicReq({ 'sec-fetch-site': 'cross-site' }), options), 403)
+  // Without the opt-in the same request stays behind the loopback fence.
+  assert.equal(structuralRejection(publicReq({ origin: 'https://ofm.onrender.com' })), 403)
+})
 check('the desktop relay Referer passes only without browser markers', () => {
   for (const referer of ['dsh-app://app/', 'dsh-app://app/settings']) {
     assert.equal(structuralRejection(req({ host: '127.0.0.1:8080', referer })), undefined)

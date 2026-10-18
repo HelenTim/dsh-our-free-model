@@ -129,7 +129,9 @@ try {
   })
   await check('routable binds and invalid ports fail before creating data', async () => {
     const invalidDir = path.join(scratch, 'invalid')
-    await assert.rejects(startStandalone({ dataDir: invalidDir, host: '0.0.0.0' }), /loopback/)
+    await assert.rejects(startStandalone({ dataDir: invalidDir, host: '0.0.0.0' }), /publicUrl/)
+    await assert.rejects(startStandalone({ dataDir: invalidDir, host: '192.168.1.2', publicUrl: 'http://192.168.1.2:18900' }), /loopback/)
+    await assert.rejects(startStandalone({ dataDir: invalidDir, host: '0.0.0.0', publicUrl: 'ftp://example.com' }), /http/)
     await assert.rejects(startStandalone({ dataDir: invalidDir, port: -1 }), /port/)
     await assert.rejects(startStandalone({ dataDir: invalidDir, port: 65536 }), /port/)
     assert.equal(fs.existsSync(invalidDir), false)

@@ -128,15 +128,27 @@ export function rejectionFor(req, connection, onRejection) {
  * The replica fence. Same shape as the kernel's `isTrustedApiRequest`: DNS
  * rebinding defence via the Host header, cross-site fetch refusal, and an
  * Origin/Referer authority match.
+ *
+ * `allowPublic` is the standalone service's explicit opt-in for a listener
+ * bound to `0.0.0.0` behind a TLS-terminating platform proxy: the loopback
+ * hostname rule is dropped, but the same-origin check stays. `trustProxy`
+ * reads `x-forwarded-proto` so an `https://` Origin matches a Host header that
+ * carries no scheme. Both default off, so the plugin's fence is unchanged.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {{allowPublic?: boolean, trustProxy?: boolean}} [options]
+ * @returns {number|undefined}
  */
-export function structuralRejection(req) {
-  return structuralReason(req) === undefined ? undefined : 403
+export function structuralRejection(req, options) {
+  return structuralReason(req, options) === undefined ? undefined : 403
 }
 
 /** Return a fixed reason without exposing caller-supplied strings. */
-function structuralReason(req) {
-  const host = authorityOf(req.headers.host, 'http')
-  if (host === null || !LOOPBACK_NAMES.has(host.hostname)) return 'host-not-loopback'
+function structuralReason(req, options = {}) {
+  const forwarded = options.trustProxy === true ? forwardedScheme(req) : undefined
+  const host = authorityOf(req.headers.host, forwarded ?? 'http')
+  if (host === null) return 'host-not-loopback'
+  if (!LOOPBACK_NAMES.has(host.hostname) && options.allowPublic !== true) return 'host-not-loopback'
   const site = String(req.headers['sec-fetch-site'] ?? '').toLowerCase()
   if (site === 'cross-site') return 'cross-site'
   for (const header of ['origin', 'referer']) {
@@ -167,6 +179,15 @@ function isDesktopRelayReferer(value) {
   } catch {
     return false
   }
+}
+
+/**
+ * The platform proxy's view of the original scheme. Only the first hop is
+ * read, and only the two schemes this server can speak.
+ */
+function forwardedScheme(req) {
+  const value = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
+  return value === 'http' || value === 'https' ? value : undefined
 }
 
 /** Split a Host/Origin/Referer value into {scheme, hostname, port}, defaulting the port. */

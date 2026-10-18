@@ -81,7 +81,12 @@ export function managementSettings(value) {
 }
 
 /** 管理读写要求鉴权；登录恢复仅允许同源页面触发固定本机动作。 */
-export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal }) {
+export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicOrigin = null }) {
+  const publicHttps = publicOrigin?.protocol === 'https:'
+  const cookieFlags = `HttpOnly; SameSite=Strict${publicHttps ? '; Secure' : ''}`
+  const expectedOrigin = req => publicOrigin === null
+    ? new URL(`http://${req.headers.host}`).origin
+    : new URL(`${publicHttps ? 'https' : 'http'}://${req.headers.host}`).origin
   let bootstrap = { token: crypto.randomBytes(32).toString('base64url'), until: Date.now() + BOOTSTRAP_MS }
   const sessions = new Map()
   let cookieName
@@ -112,7 +117,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     const parts = String(req.headers.cookie ?? '').split(';')
     return parts.map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1)
   }
-  const clearCookie = () => `${cookieName}=; Path=${PREFIX}; HttpOnly; SameSite=Strict; Max-Age=0`
+  const clearCookie = () => `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`
   const pruneSessions = () => {
     for (const [id, until] of sessions) if (until <= Date.now()) sessions.delete(id)
   }
@@ -160,7 +165,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     const method = req.method ?? 'GET'
     if (method === 'POST' && pathname === `${PREFIX}/login/terminal`) {
       // 此入口发生在登录前，必须有浏览器的同源 Origin，拒绝跨站和无来源调用。
-      if (req.headers.origin !== new URL(`http://${req.headers.host}`).origin ||
+      if (req.headers.origin !== expectedOrigin(req) ||
           req.headers['sec-fetch-site'] !== 'same-origin') {
         throw fail(403, '请从本机登录页面点击获取令牌')
       }
@@ -187,7 +192,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const id = crypto.randomBytes(32).toString('base64url')
       sessions.set(id, Date.now() + SESSION_MS)
       json(res, 200, { ok: true }, {
-        'set-cookie': `${cookieName}=${id}; Path=${PREFIX}; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MS / 1000}`,
+        'set-cookie': `${cookieName}=${id}; Path=${PREFIX}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
       })
       return
     }
@@ -212,7 +217,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
         const base = new URL(info().baseUrl)
         json(res, 200, { ok: true, value: {
           enabled: stores.settings.get().enabled !== false, running: stores.settings.get().enabled !== false,
-          blockedByEnv: false, address: { host: base.hostname, port: Number(base.port) },
+          blockedByEnv: false, address: { host: base.hostname, port: Number(base.port || (base.protocol === 'https:' ? 443 : 80)) },
           apiKey: { value: stores.settings.get().forwardKey, path: `${info().dataDir}/settings.json`, fromEnv: false },
           models: runtime.publicModelRows(), modelsSource: 'catalog',
         } })
@@ -302,15 +307,17 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const asset = assets.get(pathname)
       const isApi = pathname === PREFIX || pathname.startsWith(`${PREFIX}/`)
       if (!asset && !isApi) return false
-      // 不接受插件专用 dsh-app Referer；独立管理只允许本页面的 HTTP 来源。
+      // 不接受插件专用 dsh-app Referer；独立管理只允许本页面的 HTTP(S) 来源。
       const referer = req.headers.referer
       const origin = req.headers.origin
       const malformedSource = [referer, origin].some(value => value !== undefined && (
-        typeof value !== 'string' || !value.startsWith('http://')
+        typeof value !== 'string' || !/^https?:\/\//i.test(value)
       ))
       if (closed || !cookieName) json(res, 503, { error: '服务正在停止或启动' })
-      else if (malformedSource || structuralRejection(req) !== undefined) json(res, 403, { error: '管理接口仅允许本机同源访问' })
-      else if (asset) {
+      else if (malformedSource ||
+        structuralRejection(req, { allowPublic: publicOrigin !== null, trustProxy: publicOrigin !== null }) !== undefined) {
+        json(res, 403, { error: '管理接口仅允许同源访问' })
+      } else if (asset) {
         if (req.method !== 'GET' && req.method !== 'HEAD') json(res, 405, { error: '资源仅支持 GET 或 HEAD' })
         else {
           res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': asset.type })

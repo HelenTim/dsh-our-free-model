@@ -24,6 +24,40 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
 端口被占用时沿用共享监听器的自动选端口逻辑。后续启动优先使用本产品上次保存的端口；
 `--port` 可以覆盖，`0` 表示由系统分配。
 
+## 公网部署（Render 等 PaaS）
+
+默认只监听 `127.0.0.1`，管理页仅限本机。部署到 Render 时需要显式改为公网监听：
+
+```bash
+node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.onrender.com
+```
+
+对应环境变量：
+
+| 变量 | 用途 |
+| --- | --- |
+| `PORT` | 平台指定的监听端口；CLI 自动读取（Render 会注入） |
+| `OFM_HOST` | 监听地址；公网部署设为 `0.0.0.0` |
+| `OFM_PUBLIC_URL` | 浏览器实际访问的地址；绑定 `0.0.0.0` 时必填 |
+| `RENDER_EXTERNAL_URL` | Render 自动注入，未设置 `OFM_PUBLIC_URL` 时作为公开地址 |
+| `OFM_API_KEY` | 固定管理/推理密钥；适合没有终端、数据目录不持久的环境 |
+| `OFM_HOME` | 数据目录；Render 需挂载持久磁盘（如 `/var/data`） |
+
+仓库根目录的 `render.yaml` 已按上述配置写好：构建步骤为空（运行时无 npm 依赖），
+启动命令为 `node packages/standalone/cli.mjs`，健康检查路径 `/health`。
+绑定 `0.0.0.0` 时，信任围栏仍要求同源 Origin/Referer，并通过
+`x-forwarded-proto` 识别平台代理转发前的 https 协议；管理会话 Cookie 在 https
+下自动加上 `Secure`。页面展示的 API Base URL 使用公开地址，而不是 `0.0.0.0`。
+
+注意：
+
+- Render 免费实例没有持久磁盘，重启或重新部署会丢失账号渠道、统计和设置；
+  至少用 `OFM_API_KEY` 固定密钥，或挂载磁盘并把 `OFM_HOME` 指过去。
+- 管理页的“打开终端获取令牌”在 Linux 服务器上不可用；请用 `OFM_API_KEY`
+  或数据目录中 `settings.json` 的 `forwardKey` 登录。
+- 公网部署后管理页对互联网开放，登录仍要求 API Key；请使用足够随机的密钥，
+  并只通过 HTTPS 访问。
+
 ## 数据与鉴权
 
 - 默认目录：`~/.our-free-model`；环境变量 `OFM_HOME` 或 `--data-dir` 可以覆盖。

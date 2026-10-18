@@ -103,13 +103,34 @@ async function acquireServiceLock(dataDir) {
   }
 }
 
+function normalizePublicUrl(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  let url
+  try { url = new URL(String(value).trim()) } catch { throw new TypeError('publicUrl must be an absolute http(s) URL') }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError('publicUrl must be an absolute http(s) URL')
+  return url
+}
+
 /** 直接创建核心和 HTTP 服务，不加载插件入口、Cordis 或 DSH 凭据。 */
 export async function startStandalone({
   dataDir = resolveStandaloneDataDir(), host = '127.0.0.1', port,
+  publicUrl, apiKey,
   logger = console, refresh = true, probe, lanEnabled, lanPort,
   startRelay = startLanRelay,
 } = {}) {
-  if (!isLoopbackHost(host)) throw new TypeError('the standalone service binds a loopback address only')
+  const publicOrigin = normalizePublicUrl(publicUrl)
+  const loopbackHost = isLoopbackHost(host)
+  if (!loopbackHost && host !== '0.0.0.0') {
+    throw new TypeError('the standalone service binds a loopback address or 0.0.0.0 only')
+  }
+  // A public bind is only useful with the browser-facing URL it will be
+  // reached at; the fence and the printed login link both key off it.
+  if (!loopbackHost && publicOrigin === null) {
+    throw new TypeError('binding 0.0.0.0 requires publicUrl (OFM_PUBLIC_URL or RENDER_EXTERNAL_URL)')
+  }
+  if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.trim() === '')) {
+    throw new TypeError('apiKey must be a non-empty string')
+  }
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) throw new TypeError('dataDir must be an absolute path')
   if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) {
     throw new TypeError('port must be an integer between 0 and 65535')
@@ -175,7 +196,9 @@ export async function startStandalone({
         }
         // The shared relay targets IPv4 loopback. An IPv6 management bind needs
         // a separate inference-only loopback target, with no management handler.
-        if (listener.server.address().address !== '127.0.0.1') {
+        // A wildcard bind already answers on 127.0.0.1, so it needs none.
+        const boundAddress = listener.server.address().address
+        if (boundAddress !== '127.0.0.1' && boundAddress !== '0.0.0.0') {
           relayTarget = await startForwardServer({
             config: () => ({
               host: '127.0.0.1', port: 0,
@@ -220,8 +243,16 @@ export async function startStandalone({
     const { settings } = stores
     const savedPort = settings.get().standalonePort
     const requestedPort = port ?? (Number.isInteger(savedPort) && savedPort >= 0 && savedPort <= 65535 ? savedPort : 18900)
+    // 0.0.0.0 is a bind address, never a browser destination: the public URL
+    // is what the management page, the printed login link and the API examples
+    // must show.
+    const baseUrl = () => publicOrigin !== null
+      ? publicOrigin.origin
+      : `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`
     const existingKey = settings.get().forwardKey
-    const key = typeof existingKey === 'string' && existingKey !== '' ? existingKey : generateKey()
+    const key = apiKey !== undefined
+      ? apiKey.trim()
+      : typeof existingKey === 'string' && existingKey !== '' ? existingKey : generateKey()
     const savedLanPort = settings.get().standaloneLanPort
     settings.update({
       forwardKey: key,
@@ -256,10 +287,10 @@ export async function startStandalone({
       },
     }
     management = createManagement({
-      stores, runtime, channels, eac,
+      stores, runtime, channels, eac, publicOrigin,
       info: () => ({
         product: PRODUCT, version: VERSION, dataDir,
-        baseUrl: `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`,
+        baseUrl: baseUrl(),
         automaticRefresh: refresh,
         networkMode: process.env.OFM_TEST_UPSTREAM ? 'fixture' : 'live',
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true, lan: true },
@@ -274,6 +305,7 @@ export async function startStandalone({
       config: () => ({ host, port: requestedPort, enabled: settings.get().enabled !== false, key: settings.get().forwardKey }),
       complete: runtime.complete,
       modelRows: runtime.publicModelRows,
+      bindPublic: !loopbackHost,
       health: () => ({
         ok: true, service: PRODUCT, product: 'standalone', version: VERSION,
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true },
@@ -306,8 +338,8 @@ export async function startStandalone({
     const ready = Promise.all([channels.ready, refresh ? refreshModels(settings.get().standaloneProbe === true) : Promise.resolve()])
     return {
       product: PRODUCT, version: VERSION, dataDir,
-      url: `http://${host === '::1' ? '[::1]' : host}:${listener.port}`,
-      managementUrl: `http://${host === '::1' ? '[::1]' : host}:${listener.port}/${management.bootstrapFragment}`,
+      url: baseUrl(),
+      managementUrl: `${baseUrl()}/${management.bootstrapFragment}`,
       port: listener.port,
       keyFile: path.join(dataDir, 'settings.json'),
       runtime, channels, ready,
