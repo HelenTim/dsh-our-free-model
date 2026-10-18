@@ -38,7 +38,7 @@ node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.on
 | --- | --- |
 | `PORT` | 平台指定的监听端口；CLI 自动读取（Render 会注入） |
 | `OFM_HOST` | 监听地址；公网部署设为 `0.0.0.0` |
-| `OFM_PUBLIC_URL` | 浏览器实际访问的地址；绑定 `0.0.0.0` 时必填 |
+| `OFM_PUBLIC_URL` | 浏览器实际访问的地址；可选，未设置时使用 `RENDER_EXTERNAL_URL` 或按请求头推导 |
 | `RENDER_EXTERNAL_URL` | Render 自动注入，未设置 `OFM_PUBLIC_URL` 时作为公开地址 |
 | `OFM_API_KEY` | 固定管理/推理密钥；适合没有终端、数据目录不持久的环境 |
 | `OFM_HOME` | 数据目录；Render 需挂载持久磁盘（如 `/var/data`） |

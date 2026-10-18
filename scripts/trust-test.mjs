@@ -64,9 +64,16 @@ check('an explicit public listener keeps the same-origin fence', () => {
   assert.equal(structuralRejection(publicReq({}), options), undefined)
   assert.equal(structuralRejection(publicReq({ origin: 'https://ofm.onrender.com' }), options), undefined)
   assert.equal(structuralRejection(publicReq({ referer: 'https://ofm.onrender.com/settings' }), options), undefined)
+  // A proxy may rewrite the port or drop the forwarded scheme, so the public
+  // fence compares the hostname and leaves scheme/port to the proxy.
+  assert.equal(structuralRejection(publicReq({ origin: 'http://ofm.onrender.com' }), options), undefined)
   assert.equal(structuralRejection(publicReq({ origin: 'https://evil.example' }), options), 403)
-  assert.equal(structuralRejection(publicReq({ origin: 'http://ofm.onrender.com' }), options), 403)
   assert.equal(structuralRejection(publicReq({ 'sec-fetch-site': 'cross-site' }), options), 403)
+  // A proxy that rewrites Host to an internal address is matched by the
+  // configured public hostname.
+  const rewritten = req({ host: 'localhost:10000', 'x-forwarded-proto': 'https', origin: 'https://ofm.onrender.com' })
+  assert.equal(structuralRejection(rewritten, { ...options, publicHostname: 'ofm.onrender.com' }), undefined)
+  assert.equal(structuralRejection(rewritten, options), 403)
   // Without the opt-in the same request stays behind the loopback fence.
   assert.equal(structuralRejection(publicReq({ origin: 'https://ofm.onrender.com' })), 403)
 })

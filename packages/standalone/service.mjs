@@ -123,11 +123,10 @@ export async function startStandalone({
   if (!loopbackHost && host !== '0.0.0.0') {
     throw new TypeError('the standalone service binds a loopback address or 0.0.0.0 only')
   }
-  // A public bind is only useful with the browser-facing URL it will be
-  // reached at; the fence and the printed login link both key off it.
-  if (!loopbackHost && publicOrigin === null) {
-    throw new TypeError('binding 0.0.0.0 requires publicUrl (OFM_PUBLIC_URL or RENDER_EXTERNAL_URL)')
-  }
+  // Binding the wildcard address is the explicit opt-in for public exposure:
+  // the fence keeps same-origin but drops the loopback-hostname rule, and the
+  // browser-facing URL is derived per request when publicUrl is absent.
+  const publicMode = !loopbackHost
   if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.trim() === '')) {
     throw new TypeError('apiKey must be a non-empty string')
   }
@@ -243,12 +242,19 @@ export async function startStandalone({
     const { settings } = stores
     const savedPort = settings.get().standalonePort
     const requestedPort = port ?? (Number.isInteger(savedPort) && savedPort >= 0 && savedPort <= 65535 ? savedPort : 18900)
-    // 0.0.0.0 is a bind address, never a browser destination: the public URL
-    // is what the management page, the printed login link and the API examples
-    // must show.
-    const baseUrl = () => publicOrigin !== null
-      ? publicOrigin.origin
-      : `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`
+    // 0.0.0.0 is a bind address, never a browser destination: the management
+    // page, the printed login link and the API examples must show the public
+    // URL. Without an explicit publicUrl, derive it from the request the
+    // browser actually made (honouring the platform proxy's headers).
+    const baseUrl = req => {
+      if (publicOrigin !== null) return publicOrigin.origin
+      if (req !== undefined) {
+        const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
+        const authority = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '').split(',')[0].trim()
+        if (authority !== '') return `${proto === 'https' ? 'https' : 'http'}://${authority}`
+      }
+      return `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`
+    }
     const existingKey = settings.get().forwardKey
     const key = apiKey !== undefined
       ? apiKey.trim()
@@ -287,10 +293,10 @@ export async function startStandalone({
       },
     }
     management = createManagement({
-      stores, runtime, channels, eac, publicOrigin,
-      info: () => ({
+      stores, runtime, channels, eac, publicOrigin, publicMode,
+      info: req => ({
         product: PRODUCT, version: VERSION, dataDir,
-        baseUrl: baseUrl(),
+        baseUrl: baseUrl(req),
         automaticRefresh: refresh,
         networkMode: process.env.OFM_TEST_UPSTREAM ? 'fixture' : 'live',
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true, lan: true },

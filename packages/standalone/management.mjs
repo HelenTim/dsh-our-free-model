@@ -81,12 +81,17 @@ export function managementSettings(value) {
 }
 
 /** 管理读写要求鉴权；登录恢复仅允许同源页面触发固定本机动作。 */
-export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicOrigin = null }) {
+export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicOrigin = null, publicMode = false }) {
   const publicHttps = publicOrigin?.protocol === 'https:'
   const cookieFlags = `HttpOnly; SameSite=Strict${publicHttps ? '; Secure' : ''}`
-  const expectedOrigin = req => publicOrigin === null
-    ? new URL(`http://${req.headers.host}`).origin
-    : new URL(`${publicHttps ? 'https' : 'http'}://${req.headers.host}`).origin
+  const expectedOrigin = req => {
+    if (publicOrigin !== null) return new URL(`${publicHttps ? 'https' : 'http'}://${req.headers.host}`).origin
+    if (publicMode) {
+      const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
+      return new URL(`${proto === 'https' ? 'https' : 'http'}://${req.headers.host}`).origin
+    }
+    return new URL(`http://${req.headers.host}`).origin
+  }
   let bootstrap = { token: crypto.randomBytes(32).toString('base64url'), until: Date.now() + BOOTSTRAP_MS }
   const sessions = new Map()
   let cookieName
@@ -137,12 +142,12 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       throw fail(500, '无法保存设置，请检查数据目录权限和磁盘空间')
     }
   }
-  const summary = () => {
+  const summary = req => {
     const state = runtime.state()
     const available = stores.availability.get()
     const routable = new Set(runtime.publicModelRows().map(entry => entry.id))
     return {
-      ...info(),
+      ...info(req),
       channels: channels?.state(),
       eacAuth: eac?.cached(),
       settings: managementSettings(stores.settings.get()),
@@ -202,7 +207,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       sessions.delete(cookie(req))
       json(res, 200, { ok: true }, { 'set-cookie': clearCookie() })
     } else if (method === 'GET' && pathname === `${PREFIX}/summary`) {
-      json(res, 200, summary())
+      json(res, 200, summary(req))
     } else if (method === 'GET' && pathname === `${PREFIX}/stats`) {
       json(res, 200, buildStats(stores.stats.get(), runtime.catalog))
     } else if (method === 'POST' && pathname === `${PREFIX}/channels/rpc` && channels) {
@@ -214,7 +219,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
           persist({ enabled: body.payload.enabled })
           await onSettingsChanged()
         }
-        const base = new URL(info().baseUrl)
+        const base = new URL(info(req).baseUrl)
         json(res, 200, { ok: true, value: {
           enabled: stores.settings.get().enabled !== false, running: stores.settings.get().enabled !== false,
           blockedByEnv: false, address: { host: base.hostname, port: Number(base.port || (base.protocol === 'https:' ? 443 : 80)) },
@@ -274,7 +279,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const body = await readBody(req)
       if (body.probe !== undefined && typeof body.probe !== 'boolean') throw fail(400, 'probe 必须是布尔值')
       await runtime.refreshCatalog({ probe: body.probe === true, force: body.probe === true })
-      json(res, 200, summary())
+      json(res, 200, summary(req))
     } else if (method === 'POST' && pathname === `${PREFIX}/models/test`) {
       const body = await readBody(req)
       if (stores.settings.get().enabled === false) throw fail(503, '推理服务已暂停，请先在服务设置中启用')
@@ -314,15 +319,20 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
         typeof value !== 'string' || !/^https?:\/\//i.test(value)
       ))
       if (closed || !cookieName) json(res, 503, { error: '服务正在停止或启动' })
-      else if (malformedSource ||
-        structuralRejection(req, { allowPublic: publicOrigin !== null, trustProxy: publicOrigin !== null }) !== undefined) {
-        json(res, 403, { error: '管理接口仅允许同源访问' })
-      } else if (asset) {
+      // 登录页与静态资源不含任何凭据，从任意来源打开都安全；跨站链接的顶层
+      // 导航会带 Sec-Fetch-Site: cross-site，不能因此把登录页挡在门外。
+      // 同源围栏只保护管理 API。
+      else if (asset) {
         if (req.method !== 'GET' && req.method !== 'HEAD') json(res, 405, { error: '资源仅支持 GET 或 HEAD' })
         else {
           res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': asset.type })
           res.end(req.method === 'HEAD' ? undefined : asset.body)
         }
+      } else if (malformedSource ||
+        structuralRejection(req, {
+          allowPublic: publicMode, trustProxy: publicMode, publicHostname: publicOrigin?.hostname,
+        }) !== undefined) {
+        json(res, 403, { error: '管理接口仅允许同源访问' })
       } else {
         try { await route(req, res, pathname) } catch (error) {
           if (!res.destroyed && !res.headersSent) json(res, error.statusCode ?? 500, {

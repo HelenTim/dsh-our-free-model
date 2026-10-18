@@ -133,10 +133,12 @@ export function rejectionFor(req, connection, onRejection) {
  * bound to `0.0.0.0` behind a TLS-terminating platform proxy: the loopback
  * hostname rule is dropped, but the same-origin check stays. `trustProxy`
  * reads `x-forwarded-proto` so an `https://` Origin matches a Host header that
- * carries no scheme. Both default off, so the plugin's fence is unchanged.
+ * carries no scheme. `publicHostname` names the operator-configured public
+ * host, for proxies that rewrite `Host` to an internal address. All default
+ * off, so the plugin's fence is unchanged.
  *
  * @param {import('node:http').IncomingMessage} req
- * @param {{allowPublic?: boolean, trustProxy?: boolean}} [options]
+ * @param {{allowPublic?: boolean, trustProxy?: boolean, publicHostname?: string}} [options]
  * @returns {number|undefined}
  */
 export function structuralRejection(req, options) {
@@ -164,8 +166,16 @@ function structuralReason(req, options = {}) {
     const authority = authorityOf(raw.trim())
     if (authority === null) return `${header}-invalid`
     // The web server speaks plain http on a loopback bind, so an Origin that
-    // claims https — or any other scheme — is not this page.
-    if (authority.scheme !== host.scheme || authority.hostname !== host.hostname || authority.port !== host.port) return `${header}-mismatch`
+    // claims https — or any other scheme — is not this page. A public listener
+    // sits behind a proxy that may rewrite the port or omit the forwarded
+    // scheme, so there only the hostname has to match.
+    if (options.allowPublic === true) {
+      const allowed = authority.hostname === host.hostname ||
+        (typeof options.publicHostname === 'string' && authority.hostname === options.publicHostname.toLowerCase())
+      if (!allowed) return `${header}-mismatch`
+    } else if (authority.scheme !== host.scheme || authority.hostname !== host.hostname || authority.port !== host.port) {
+      return `${header}-mismatch`
+    }
   }
   return undefined
 }
