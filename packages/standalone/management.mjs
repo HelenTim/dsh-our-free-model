@@ -152,11 +152,19 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     res.once('close', () => upstream.destroy())
     req.pipe(upstream)
   })
-  const cookie = req => {
-    const parts = String(req.headers.cookie ?? '').split(';')
-    return parts.map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1)
+  // 同名 Cookie 可能同时存在多条（例如旧版本 Path=/api/management 的那条），
+  // 浏览器按路径长度排序，只读第一条会把过期会话当成未登录，因此逐个检查。
+  const cookieValues = req => {
+    const name = `${cookieName}=`
+    return String(req.headers.cookie ?? '').split(';')
+      .map(value => value.trim())
+      .filter(value => value.startsWith(name))
+      .map(value => value.slice(name.length))
   }
-  const clearCookie = () => `${cookieName}=; Path=${cookiePath}; ${cookieFlags}; Max-Age=0`
+  const clearCookie = () => [
+    `${cookieName}=; Path=${cookiePath}; ${cookieFlags}; Max-Age=0`,
+    `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`,
+  ]
   const pruneSessions = () => {
     for (const [id, until] of sessions) if (until <= Date.now()) sessions.delete(id)
   }
@@ -164,7 +172,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     const bearer = /^Bearer (.+)$/i.exec(String(req.headers.authorization ?? ''))?.[1]
     if (matches(bearer, stores.settings.get().forwardKey)) return true
     pruneSessions()
-    return sessions.has(cookie(req))
+    return cookieValues(req).some(id => sessions.has(id))
   }
   const persist = patch => {
     const previous = stores.settings.get()
@@ -231,14 +239,17 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const id = crypto.randomBytes(32).toString('base64url')
       sessions.set(id, Date.now() + SESSION_MS)
       json(res, 200, { ok: true }, {
-        'set-cookie': `${cookieName}=${id}; Path=${cookiePath}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
+        'set-cookie': [
+          `${cookieName}=${id}; Path=${cookiePath}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
+          `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`,
+        ],
       })
       return
     }
     if (!authenticated(req)) throw fail(401, '请先登录管理页面')
     if (method === 'POST' && pathname === `${PREFIX}/logout`) {
       await readBody(req)
-      sessions.delete(cookie(req))
+      for (const id of cookieValues(req)) sessions.delete(id)
       json(res, 200, { ok: true }, { 'set-cookie': clearCookie() })
     } else if (method === 'GET' && pathname === `${PREFIX}/summary`) {
       json(res, 200, summary(req))
@@ -305,12 +316,11 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     } else if (method === 'POST' && pathname === `${PREFIX}/key/rotate`) {
       const body = await readBody(req)
       if (body.confirm !== true) throw fail(400, '请确认轮换 API Key')
-      const id = cookie(req)
+      const kept = cookieValues(req).map(id => [id, sessions.get(id)]).filter(([, until]) => until !== undefined)
       persist({ forwardKey: generateKey() })
       // 仅当前管理会话保留；旧密钥与其他会话立即失效。
-      const until = sessions.get(id)
       sessions.clear()
-      if (until) sessions.set(id, until)
+      for (const [id, until] of kept) sessions.set(id, until)
       bootstrap = null
       json(res, 200, { key: stores.settings.get().forwardKey })
     } else if (method === 'POST' && pathname === `${PREFIX}/models/refresh`) {

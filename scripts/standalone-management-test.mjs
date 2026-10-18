@@ -330,6 +330,14 @@ try {
     assert.equal((await request('/api/management/summary')).status, 401)
     cookie = await login({ key })
   })
+  await check('旧路径的同名会话 Cookie 不会盖住新会话', async () => {
+    const stale = `ofm_management_${service.port}=stale`
+    assert.equal((await request('/api/management/summary', { cookie: `${stale}; ${cookie}` })).status, 200)
+    // 登录响应同时清掉旧版本 Path=/api/management 的那条同名 Cookie。
+    const response = await request('/api/management/session', { cookie: '', body: { key } })
+    const cookies = response.headers.getSetCookie()
+    assert.equal(cookies.some(value => value.includes('Path=/api/management') && value.includes('Max-Age=0')), true)
+  })
   await check('重启保留设置与密钥但清除会话，新的登录链接独立生成', async () => {
     const oldUrl = service.managementUrl
     const previousPort = service.port
