@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import { buildStats } from '../../src/core/stats.js'
 import { generateKey } from '../../src/forward.js'
 import { structuralRejection } from '../../src/trust.js'
@@ -84,6 +85,9 @@ export function managementSettings(value) {
 export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicOrigin = null, publicMode = false }) {
   const publicHttps = publicOrigin?.protocol === 'https:'
   const cookieFlags = `HttpOnly; SameSite=Strict${publicHttps ? '; Secure' : ''}`
+  // 登录弹窗页（/raccoon/*、/wechat/*）由渠道在回环端口上渲染、经主监听器转发，
+  // 不在 /api/management 之下；Cookie 必须覆盖全站，弹窗与页内轮询才带得上会话。
+  const cookiePath = '/'
   const expectedOrigin = req => {
     if (publicOrigin !== null) return new URL(`${publicHttps ? 'https' : 'http'}://${req.headers.host}`).origin
     if (publicMode) {
@@ -118,11 +122,41 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8', ...headers })
     res.end(JSON.stringify(payload))
   }
+  const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'])
+  /**
+   * 转发渠道登录页。Raccoon / Loomy 的二维码页由渠道在服务端临时起的回环服务
+   * 渲染，公网部署时浏览器够不着那个随机端口，只能经主监听器按已登记的前缀转发。
+   * 该页面能完成一次账号登录，所以必须已登录管理页；会话 Cookie 是 host-only
+   * 且 SameSite=Strict，跨站请求带不上，鉴权本身就挡住了 CSRF。
+   */
+  const proxyLoginPage = (req, res, port) => new Promise(resolve => {
+    const headers = {}
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (!HOP_BY_HOP.has(name) && name !== 'host') headers[name] = value
+    }
+    const upstream = http.request({ host: '127.0.0.1', port, path: req.url, method: req.method, headers }, answer => {
+      const out = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
+      for (const [name, value] of Object.entries(answer.headers)) {
+        if (!HOP_BY_HOP.has(name)) out[name] = value
+      }
+      res.writeHead(answer.statusCode ?? 502, out)
+      answer.pipe(res)
+      answer.on('end', resolve)
+    })
+    upstream.setTimeout(30_000, () => upstream.destroy(new Error('登录页响应超时')))
+    upstream.on('error', () => {
+      if (!res.destroyed && !res.headersSent) json(res, 502, { error: '登录页面已关闭，请重新发起登录' })
+      else res.destroy()
+      resolve()
+    })
+    res.once('close', () => upstream.destroy())
+    req.pipe(upstream)
+  })
   const cookie = req => {
     const parts = String(req.headers.cookie ?? '').split(';')
     return parts.map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1)
   }
-  const clearCookie = () => `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`
+  const clearCookie = () => `${cookieName}=; Path=${cookiePath}; ${cookieFlags}; Max-Age=0`
   const pruneSessions = () => {
     for (const [id, until] of sessions) if (until <= Date.now()) sessions.delete(id)
   }
@@ -197,7 +231,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const id = crypto.randomBytes(32).toString('base64url')
       sessions.set(id, Date.now() + SESSION_MS)
       json(res, 200, { ok: true }, {
-        'set-cookie': `${cookieName}=${id}; Path=${PREFIX}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
+        'set-cookie': `${cookieName}=${id}; Path=${cookiePath}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
       })
       return
     }
@@ -213,7 +247,11 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     } else if (method === 'POST' && pathname === `${PREFIX}/channels/rpc` && channels) {
       // 渠道备份导入包含多账号凭据，仍限制总大小，但不能套设置表单的 16KB。
       const body = await readBody(req, 8 * 1024 * 1024)
-      if (body.method === 'gateway.getEnabled' || body.method === 'gateway.setEnabled') {
+      if (body.method === 'login.callback') {
+        // 本机回环回调型登录（CodeArts / LobsterAI / TRAE / Gemini）：
+        // 浏览器打不开 127.0.0.1 上的回调，用户把地址栏里那条链接粘贴回来。
+        json(res, 200, { ok: true, value: await channels.relayLoginCallback(body.payload) })
+      } else if (body.method === 'gateway.getEnabled' || body.method === 'gateway.setEnabled') {
         if (body.method === 'gateway.setEnabled') {
           if (typeof body.payload?.enabled !== 'boolean') throw fail(400, 'enabled 必须是布尔值')
           persist({ enabled: body.payload.enabled })
@@ -230,7 +268,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
         const controller = new AbortController()
         const abort = () => controller.abort()
         res.once('close', abort)
-        try { json(res, 200, await channels.rpc(body, controller.signal)) }
+        try { json(res, 200, await channels.rpc(body, controller.signal, info(req).baseUrl)) }
         finally { res.removeListener('close', abort) }
       }
     } else if (eac && pathname.startsWith(`${PREFIX}/eac/`)) {
@@ -311,7 +349,8 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
       const asset = assets.get(pathname)
       const isApi = pathname === PREFIX || pathname.startsWith(`${PREFIX}/`)
-      if (!asset && !isApi) return false
+      const loginPage = !asset && !isApi ? channels?.loginTarget?.(pathname) : undefined
+      if (!asset && !isApi && loginPage === undefined) return false
       // 不接受插件专用 dsh-app Referer；独立管理只允许本页面的 HTTP(S) 来源。
       const referer = req.headers.referer
       const origin = req.headers.origin
@@ -328,6 +367,16 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
           res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': asset.type })
           res.end(req.method === 'HEAD' ? undefined : asset.body)
         }
+      } else if (loginPage !== undefined) {
+        // 登录弹窗由管理页 window.open 打开，Cookie 已随同源导航送达；
+        // 这里不再套 Origin 围栏（弹窗可能带 about:blank Referer），
+        // 以 host-only 会话 Cookie 作为唯一判据。
+        if (!authenticated(req)) {
+          // 旧会话的 Cookie 只覆盖 /api/management，弹窗带不上；把弹窗送回管理页，
+          // 重新登录后新的全站 Cookie 才会随弹窗与页内轮询发送。
+          res.writeHead(302, { ...SECURITY_HEADERS, location: '/' })
+          res.end()
+        } else await proxyLoginPage(req, res, loginPage.port)
       } else if (malformedSource ||
         structuralRejection(req, {
           allowPublic: publicMode, trustProxy: publicMode, publicHostname: publicOrigin?.hostname,

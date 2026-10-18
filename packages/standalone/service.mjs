@@ -49,14 +49,20 @@ async function acquireServiceLock(dataDir) {
   let lock
   let ownedStat
   const removeOwnedLock = () => {
+    let probe
+    let owned = false
     try {
-      const current = fs.lstatSync(lockFile)
-      if (current.isFile() && current.dev === ownedStat.dev && current.ino === ownedStat.ino) {
-        fs.unlinkSync(lockFile)
-      }
+      // Windows 上按路径 stat 的 dev 恒为 0，只有句柄 fstat 给出卷序列号；
+      // 两种来源混比会让锁永远删不掉，因此这里也统一用句柄 fstat。
+      probe = fs.openSync(lockFile, 'r')
+      const current = fs.fstatSync(probe)
+      owned = current.isFile() && current.dev === ownedStat.dev && current.ino === ownedStat.ino
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
+    } finally {
+      if (probe !== undefined) fs.closeSync(probe)
     }
+    if (owned) fs.unlinkSync(lockFile)
   }
   try {
     try { lock = fs.openSync(lockFile, 'wx', 0o600) }

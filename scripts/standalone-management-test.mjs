@@ -90,7 +90,9 @@ const login = async body => {
   const setCookie = response.headers.get('set-cookie')
   assert.match(setCookie, /HttpOnly/)
   assert.match(setCookie, /SameSite=Strict/)
-  assert.match(setCookie, /Path=\/api\/management/)
+  // 会话 Cookie 覆盖全站：Raccoon / Loomy 的登录弹窗页经主监听器转发，
+  // 不在 /api/management 之下，必须随弹窗与页内轮询一起发送。
+  assert.match(setCookie, /Path=\/(?:;|$)/)
   return setCookie.split(';')[0]
 }
 

@@ -43,8 +43,8 @@ node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.on
 | `OFM_API_KEY` | 固定管理/推理密钥；适合没有终端、数据目录不持久的环境 |
 | `OFM_HOME` | 数据目录；Render 需挂载持久磁盘（如 `/var/data`） |
 
-仓库根目录的 `render.yaml` 已按上述配置写好：构建步骤为空（运行时无 npm 依赖），
-启动命令为 `node packages/standalone/cli.mjs`，健康检查路径 `/health`。
+全部配置通过环境变量完成，不需要 `render.yaml`：构建步骤留空（运行时无 npm
+依赖），启动命令为 `node packages/standalone/cli.mjs`，健康检查路径 `/health`。
 绑定 `0.0.0.0` 时，信任围栏仍要求同源 Origin/Referer，并通过
 `x-forwarded-proto` 识别平台代理转发前的 https 协议；管理会话 Cookie 在 https
 下自动加上 `Secure`。页面展示的 API Base URL 使用公开地址，而不是 `0.0.0.0`。
@@ -58,6 +58,24 @@ node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.on
 - 公网部署后管理页对互联网开放，登录仍要求 API Key；请使用足够随机的密钥，
   并只通过 HTTPS 访问。
 
+### 账号渠道登录
+
+十三个免费渠道按登录方式分三类：
+
+| 方式 | 渠道 | 公网可用性 |
+| --- | --- | --- |
+| 设备码或服务端轮询 | CodeBuddy、WorkBuddy、Qoder、Qoder 中国版、Cline、MiniMax Code、ZCode | 可用。弹窗打开上游授权页，服务端自己轮询取凭据。 |
+| 服务端承载的二维码页 | Raccoon、Loomy | 可用。登录地址改写为主服务公开地址，按路径前缀转发到渠道在回环端口起的临时页面，要求已登录管理页。 |
+| 本机回环回调 | CodeArts、LobsterAI、TRAE、Gemini | 可用。授权后浏览器会跳到 `127.0.0.1` 并显示无法访问；把地址栏里那条完整链接粘贴回渠道页的「提交回调地址」，服务端会转发给仍在等待的回环回调服务。 |
+
+第三类的回调链接只在本次登录的等待窗口内有效（多数渠道为 3 到 10 分钟），
+且必须以 `http://127.0.0.1` 或 `http://localhost` 开头；服务端只转发给这次
+登录实际监听的端口和路径。也可以在本机登录后导出账号备份，再导入到挂载
+持久磁盘的 `OFM_HOME`。
+
+Raccoon / Loomy 的登录弹窗依赖管理会话 Cookie。升级到本版本后需要重新登录一次管理页，
+旧会话的 Cookie 只覆盖 `/api/management`，带不到登录弹窗。
+
 ## 数据与鉴权
 
 - 默认目录：`~/.our-free-model`；环境变量 `OFM_HOME` 或 `--data-dir` 可以覆盖。
@@ -70,7 +88,8 @@ node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.on
 - `GET /health` 提供不含凭据的产品状态；推理接口与模型清单需要 `Authorization: Bearer <API Key>`。
 - 同一个数据目录只能启动一个本地服务实例。正常退出会清除 `service.lock`。
 - 异常退出后若锁仍存在，先检查锁文件记录的 PID，确认旧进程已停止，再移除该锁文件。
-- 管理页面和管理 API 只监听回环地址；局域网推理需要显式开启独立中继。
+- 默认只监听回环地址；只有显式 `--host 0.0.0.0`（或 `OFM_HOST=0.0.0.0`）才对外监听。
+  局域网推理仍需要显式开启独立中继。
 
 插件仍使用 `DSH_HOME/our-free-model` 或 `~/.dsh/our-free-model`，两者默认互不影响。
 不要主动把独立服务的 `OFM_HOME` 指向插件的数据目录。
