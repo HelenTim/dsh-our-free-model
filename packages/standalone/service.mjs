@@ -15,7 +15,48 @@ const VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta
 
 export function resolveStandaloneDataDir(env = process.env, home = os.homedir()) {
   const configured = typeof env.OFM_HOME === 'string' ? env.OFM_HOME.trim() : ''
-  return configured === '' ? path.join(home, '.our-free-model') : path.resolve(configured)
+  if (configured !== '') return path.resolve(configured)
+  // Render's filesystem is ephemeral either way; an explicit scratch directory
+  // avoids depending on whether the platform home is writable.
+  if (env.RENDER === 'true') return path.join(os.tmpdir(), 'our-free-model')
+  return path.join(home, '.our-free-model')
+}
+
+/**
+ * An API key supplied by the platform survives restarts even when the data
+ * directory does not. `OFM_FORWARD_KEY` is the canonical name; `OFM_API_KEY`
+ * is accepted as the friendlier alias.
+ */
+export function resolveForwardKey(env = process.env) {
+  for (const name of ['OFM_FORWARD_KEY', 'OFM_API_KEY']) {
+    const value = typeof env[name] === 'string' ? env[name].trim() : ''
+    if (value !== '') return value
+  }
+  return undefined
+}
+
+/**
+ * Public base URL used for the API address and the one-time management link.
+ *
+ * `OFM_PUBLIC_URL` wins; otherwise Render's `RENDER_EXTERNAL_URL` is used so a
+ * blueprint deploy needs no extra configuration. Returns `undefined` for a
+ * purely local run, where the listener address is the right answer.
+ */
+export function resolvePublicUrl(env = process.env) {
+  const configured = typeof env.OFM_PUBLIC_URL === 'string' ? env.OFM_PUBLIC_URL.trim() : ''
+  const candidate = configured !== ''
+    ? configured
+    : typeof env.RENDER_EXTERNAL_URL === 'string' ? env.RENDER_EXTERNAL_URL.trim() : ''
+  if (candidate === '') return undefined
+  let url
+  try { url = new URL(candidate) } catch { url = undefined }
+  if (url === undefined || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+    // A malformed explicit URL would silently weaken the management fence, so
+    // refuse it. A platform-provided value is best-effort only.
+    if (configured !== '') throw new TypeError('OFM_PUBLIC_URL must be an absolute http(s) URL')
+    return undefined
+  }
+  return url.origin
 }
 
 /** 内核自动释放的互斥端点，串行化同一数据目录的锁检查与回收。 */
@@ -49,20 +90,14 @@ async function acquireServiceLock(dataDir) {
   let lock
   let ownedStat
   const removeOwnedLock = () => {
-    let probe
-    let owned = false
     try {
-      // Windows 上按路径 stat 的 dev 恒为 0，只有句柄 fstat 给出卷序列号；
-      // 两种来源混比会让锁永远删不掉，因此这里也统一用句柄 fstat。
-      probe = fs.openSync(lockFile, 'r')
-      const current = fs.fstatSync(probe)
-      owned = current.isFile() && current.dev === ownedStat.dev && current.ino === ownedStat.ino
+      const current = fs.lstatSync(lockFile)
+      if (current.isFile() && current.dev === ownedStat.dev && current.ino === ownedStat.ino) {
+        fs.unlinkSync(lockFile)
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
-    } finally {
-      if (probe !== undefined) fs.closeSync(probe)
     }
-    if (owned) fs.unlinkSync(lockFile)
   }
   try {
     try { lock = fs.openSync(lockFile, 'wx', 0o600) }
@@ -109,32 +144,25 @@ async function acquireServiceLock(dataDir) {
   }
 }
 
-function normalizePublicUrl(value) {
-  if (value === undefined || value === null || String(value).trim() === '') return null
-  let url
-  try { url = new URL(String(value).trim()) } catch { throw new TypeError('publicUrl must be an absolute http(s) URL') }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError('publicUrl must be an absolute http(s) URL')
-  return url
-}
-
 /** 直接创建核心和 HTTP 服务，不加载插件入口、Cordis 或 DSH 凭据。 */
 export async function startStandalone({
   dataDir = resolveStandaloneDataDir(), host = '127.0.0.1', port,
-  publicUrl, apiKey,
   logger = console, refresh = true, probe, lanEnabled, lanPort,
-  startRelay = startLanRelay,
+  startRelay = startLanRelay, allowNonLoopback = false, publicUrl = resolvePublicUrl(),
 } = {}) {
-  const publicOrigin = normalizePublicUrl(publicUrl)
-  const loopbackHost = isLoopbackHost(host)
-  if (!loopbackHost && host !== '0.0.0.0') {
-    throw new TypeError('the standalone service binds a loopback address or 0.0.0.0 only')
+  if (typeof host !== 'string' || host.trim() === '') throw new TypeError('host must be a non-empty string')
+  // Public binding is an explicit opt-in: the default stays loopback-only so a
+  // settings file or an accidental flag cannot expose the management surface.
+  if (!isLoopbackHost(host) && allowNonLoopback !== true) {
+    throw new TypeError('the standalone service binds a loopback address only; set allowNonLoopback for a public deployment')
   }
-  // Binding the wildcard address is the explicit opt-in for public exposure:
-  // the fence keeps same-origin but drops the loopback-hostname rule, and the
-  // browser-facing URL is derived per request when publicUrl is absent.
-  const publicMode = !loopbackHost
-  if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.trim() === '')) {
-    throw new TypeError('apiKey must be a non-empty string')
+  if (publicUrl !== undefined) {
+    let parsed
+    try { parsed = new URL(publicUrl) } catch { parsed = undefined }
+    if (parsed === undefined || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+      throw new TypeError('publicUrl must be an absolute http(s) URL')
+    }
+    publicUrl = parsed.origin
   }
   if (typeof dataDir !== 'string' || !path.isAbsolute(dataDir)) throw new TypeError('dataDir must be an absolute path')
   if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65535)) {
@@ -199,11 +227,10 @@ export async function startStandalone({
             value.standaloneLanKey === value.forwardKey) {
           settingsPersist({ standaloneLanKey: generateKey() })
         }
-        // The shared relay targets IPv4 loopback. An IPv6 management bind needs
-        // a separate inference-only loopback target, with no management handler.
-        // A wildcard bind already answers on 127.0.0.1, so it needs none.
-        const boundAddress = listener.server.address().address
-        if (boundAddress !== '127.0.0.1' && boundAddress !== '0.0.0.0') {
+        // The shared relay targets IPv4 loopback. Only an IPv6 loopback
+        // management bind needs a separate inference-only target; a wildcard
+        // bind already answers on 127.0.0.1.
+        if (listener.server.address()?.address === '::1') {
           relayTarget = await startForwardServer({
             config: () => ({
               host: '127.0.0.1', port: 0,
@@ -248,23 +275,9 @@ export async function startStandalone({
     const { settings } = stores
     const savedPort = settings.get().standalonePort
     const requestedPort = port ?? (Number.isInteger(savedPort) && savedPort >= 0 && savedPort <= 65535 ? savedPort : 18900)
-    // 0.0.0.0 is a bind address, never a browser destination: the management
-    // page, the printed login link and the API examples must show the public
-    // URL. Without an explicit publicUrl, derive it from the request the
-    // browser actually made (honouring the platform proxy's headers).
-    const baseUrl = req => {
-      if (publicOrigin !== null) return publicOrigin.origin
-      if (req !== undefined) {
-        const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
-        const authority = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '').split(',')[0].trim()
-        if (authority !== '') return `${proto === 'https' ? 'https' : 'http'}://${authority}`
-      }
-      return `http://${host === '::1' ? '[::1]' : host}:${listener?.port ?? requestedPort}`
-    }
     const existingKey = settings.get().forwardKey
-    const key = apiKey !== undefined
-      ? apiKey.trim()
-      : typeof existingKey === 'string' && existingKey !== '' ? existingKey : generateKey()
+    const envKey = resolveForwardKey()
+    const key = envKey ?? (typeof existingKey === 'string' && existingKey !== '' ? existingKey : generateKey())
     const savedLanPort = settings.get().standaloneLanPort
     settings.update({
       forwardKey: key,
@@ -298,11 +311,19 @@ export async function startStandalone({
         await Promise.all([core.refreshCatalog(options), channels.refresh().catch(error => { if (!stopped) throw error })])
       },
     }
+    // A wildcard bind is not a dialable address; use loopback for the local
+    // fallback URL. The public URL (when configured) is what gets printed.
+    const displayHost = host === '::1' ? '[::1]' : host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host
+    const localBaseUrl = () => `http://${displayHost}:${listener?.port ?? requestedPort}`
+    const publicBaseUrl = () => publicUrl ?? localBaseUrl()
     management = createManagement({
-      stores, runtime, channels, eac, publicOrigin, publicMode,
-      info: req => ({
+      stores, runtime, channels, eac,
+      publicUrl,
+      remoteAccess: allowNonLoopback,
+      keyFromEnv: envKey !== undefined,
+      info: () => ({
         product: PRODUCT, version: VERSION, dataDir,
-        baseUrl: baseUrl(req),
+        baseUrl: publicBaseUrl(),
         automaticRefresh: refresh,
         networkMode: process.env.OFM_TEST_UPSTREAM ? 'fixture' : 'live',
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true, lan: true },
@@ -314,10 +335,10 @@ export async function startStandalone({
       },
     })
     listener = await startForwardServer({
+      allowNonLoopback,
       config: () => ({ host, port: requestedPort, enabled: settings.get().enabled !== false, key: settings.get().forwardKey }),
       complete: runtime.complete,
       modelRows: runtime.publicModelRows,
-      bindPublic: !loopbackHost,
       health: () => ({
         ok: true, service: PRODUCT, product: 'standalone', version: VERSION,
         capabilities: { anonymous: true, kilo: true, eac: true, accountChannels: true, webUi: true },
@@ -350,8 +371,8 @@ export async function startStandalone({
     const ready = Promise.all([channels.ready, refresh ? refreshModels(settings.get().standaloneProbe === true) : Promise.resolve()])
     return {
       product: PRODUCT, version: VERSION, dataDir,
-      url: baseUrl(),
-      managementUrl: `${baseUrl()}/${management.bootstrapFragment}`,
+      url: publicBaseUrl(),
+      managementUrl: `${publicBaseUrl()}/${management.bootstrapFragment}`,
       port: listener.port,
       keyFile: path.join(dataDir, 'settings.json'),
       runtime, channels, ready,

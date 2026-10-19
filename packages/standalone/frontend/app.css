@@ -248,16 +248,6 @@ main { flex: 1; min-width: 0; }
 .provider-detail-description h2 { font-size: 16px; }
 .provider-detail-description p { font-size: 12px; margin: 5px 0 17px; }
 .detail-security-note { display: flex; align-items: flex-start; gap: 7px; font-size: 11px; color: #7b8593; margin-top: 17px; }
-.callback-relay { margin-top: 16px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
-.callback-relay h3 { font-size: 13px; margin-bottom: 6px; }
-.callback-relay p { font-size: 11px; color: var(--dsw-alias-label-secondary); line-height: 1.6; }
-.callback-relay code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: var(--dsw-alias-bg-layer-3); padding: 1px 4px; border-radius: 4px; }
-.callback-relay-row { display: flex; gap: 9px; margin-top: 12px; }
-.callback-relay-row .ui-input { flex: 1; min-width: 0; }
-.callback-relay-note { margin-top: 9px; overflow-wrap: anywhere; }
-@media (max-width: 640px) {
-  .callback-relay-row { flex-direction: column; }
-}
 .ofm_root { font-family: inherit; color: var(--ink); }
 #channel-root { gap: 16px; }
 .ofm_root > .dashboard-heading { margin-bottom: 0; }

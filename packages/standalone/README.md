@@ -24,58 +24,6 @@ npm run start:standalone -- --port 18900 --data-dir F:\ofm-data
 端口被占用时沿用共享监听器的自动选端口逻辑。后续启动优先使用本产品上次保存的端口；
 `--port` 可以覆盖，`0` 表示由系统分配。
 
-## 公网部署（Render 等 PaaS）
-
-默认只监听 `127.0.0.1`，管理页仅限本机。部署到 Render 时需要显式改为公网监听：
-
-```bash
-node packages/standalone/cli.mjs --host 0.0.0.0 --public-url https://your-app.onrender.com
-```
-
-对应环境变量：
-
-| 变量 | 用途 |
-| --- | --- |
-| `PORT` | 平台指定的监听端口；CLI 自动读取（Render 会注入） |
-| `OFM_HOST` | 监听地址；公网部署设为 `0.0.0.0` |
-| `OFM_PUBLIC_URL` | 浏览器实际访问的地址；可选，未设置时使用 `RENDER_EXTERNAL_URL` 或按请求头推导 |
-| `RENDER_EXTERNAL_URL` | Render 自动注入，未设置 `OFM_PUBLIC_URL` 时作为公开地址 |
-| `OFM_API_KEY` | 固定管理/推理密钥；适合没有终端、数据目录不持久的环境 |
-| `OFM_HOME` | 数据目录；Render 需挂载持久磁盘（如 `/var/data`） |
-
-全部配置通过环境变量完成，不需要 `render.yaml`：构建步骤留空（运行时无 npm
-依赖），启动命令为 `node packages/standalone/cli.mjs`，健康检查路径 `/health`。
-绑定 `0.0.0.0` 时，信任围栏仍要求同源 Origin/Referer，并通过
-`x-forwarded-proto` 识别平台代理转发前的 https 协议；管理会话 Cookie 在 https
-下自动加上 `Secure`。页面展示的 API Base URL 使用公开地址，而不是 `0.0.0.0`。
-
-注意：
-
-- Render 免费实例没有持久磁盘，重启或重新部署会丢失账号渠道、统计和设置；
-  至少用 `OFM_API_KEY` 固定密钥，或挂载磁盘并把 `OFM_HOME` 指过去。
-- 管理页的“打开终端获取令牌”在 Linux 服务器上不可用；请用 `OFM_API_KEY`
-  或数据目录中 `settings.json` 的 `forwardKey` 登录。
-- 公网部署后管理页对互联网开放，登录仍要求 API Key；请使用足够随机的密钥，
-  并只通过 HTTPS 访问。
-
-### 账号渠道登录
-
-十三个免费渠道按登录方式分三类：
-
-| 方式 | 渠道 | 公网可用性 |
-| --- | --- | --- |
-| 设备码或服务端轮询 | CodeBuddy、WorkBuddy、Qoder、Qoder 中国版、Cline、MiniMax Code、ZCode | 可用。弹窗打开上游授权页，服务端自己轮询取凭据。 |
-| 服务端承载的二维码页 | Raccoon、Loomy | 可用。登录地址改写为主服务公开地址，按路径前缀转发到渠道在回环端口起的临时页面，要求已登录管理页。 |
-| 本机回环回调 | CodeArts、LobsterAI、TRAE、Gemini | 可用。授权后浏览器会跳到 `127.0.0.1` 并显示无法访问；把地址栏里那条完整链接粘贴回渠道页的「提交回调地址」，服务端会转发给仍在等待的回环回调服务。 |
-
-第三类的回调链接只在本次登录的等待窗口内有效（多数渠道为 3 到 10 分钟），
-且必须以 `http://127.0.0.1` 或 `http://localhost` 开头；服务端只转发给这次
-登录实际监听的端口和路径。也可以在本机登录后导出账号备份，再导入到挂载
-持久磁盘的 `OFM_HOME`。
-
-Raccoon / Loomy 的登录弹窗依赖管理会话 Cookie。升级到本版本后需要重新登录一次管理页，
-旧会话的 Cookie 只覆盖 `/api/management`，带不到登录弹窗。
-
 ## 数据与鉴权
 
 - 默认目录：`~/.our-free-model`；环境变量 `OFM_HOME` 或 `--data-dir` 可以覆盖。
@@ -85,11 +33,12 @@ Raccoon / Loomy 的登录弹窗依赖管理会话 Cookie。升级到本版本后
 - 首次启动不会自动搬迁插件账号。需要迁移时，在插件中导出账号备份，再在独立网页的
   “免费账号渠道 → 供应商与备份”手动导入。备份包含明文凭据，请妥善保存。
 - API Key 为此产品单独生成，保存在该目录的 `settings.json` 的 `forwardKey` 字段。
+  `OFM_FORWARD_KEY`（别名 `OFM_API_KEY`）可以覆盖它；环境变量优先，适合没有持久磁盘的部署。
 - `GET /health` 提供不含凭据的产品状态；推理接口与模型清单需要 `Authorization: Bearer <API Key>`。
 - 同一个数据目录只能启动一个本地服务实例。正常退出会清除 `service.lock`。
 - 异常退出后若锁仍存在，先检查锁文件记录的 PID，确认旧进程已停止，再移除该锁文件。
-- 默认只监听回环地址；只有显式 `--host 0.0.0.0`（或 `OFM_HOST=0.0.0.0`）才对外监听。
-  局域网推理仍需要显式开启独立中继。
+- 管理页面和管理 API 默认只监听回环地址；局域网推理需要显式开启独立中继。
+  远程部署需要显式 `--host 0.0.0.0`（或 `OFM_HOST=0.0.0.0`），并建议配置公网地址。
 
 插件仍使用 `DSH_HOME/our-free-model` 或 `~/.dsh/our-free-model`，两者默认互不影响。
 不要主动把独立服务的 `OFM_HOME` 指向插件的数据目录。
@@ -134,10 +83,72 @@ LAN Key 保存在当前独立目录的 `settings.json` 的 `standaloneLanKey` �
 未知字段、自定义监听 host、目标地址和客户端提交的密钥均不接受。
 
 这只解决 issue #351 的 LAN 推理接入。issue #216 的 Docker / FPK / NAS
-远程管理部署仍未实现：管理监听器和 Host 信任围栏仍限 loopback，
-不支持 `--host`、`OFM_ALLOW_NON_LOOPBACK` 或 `OFM_TRUSTED_HOSTS` 放宽管理访问。
-容器映射中继端口可供已配置的推理客户端连接，但不能据此从 LAN 打开管理页，
-也没有提供容器镜像、FPK 包或容器内账号 OAuth 登录适配。
+远程管理部署仍未实现为开箱功能：默认仍拒绝非回环监听，
+只有显式传入 `--host 0.0.0.0` 或 `OFM_HOST=0.0.0.0` 才会公开监听；
+管理页的 Host 信任围栏只额外接受 `OFM_PUBLIC_URL`（Render 下自动读取
+`RENDER_EXTERNAL_URL`）声明的那个来源，其余 Host 仍被拒绝。
+
+## 部署到 Render（仅环境变量）
+
+不使用 `render.yaml`，在 Render 控制台 New → Web Service 连接仓库后按下面填写。
+
+服务配置：
+
+| 字段 | 值 |
+| --- | --- |
+| Runtime | Node |
+| Build Command | `echo "no build required"`（前端资源已提交，服务端没有运行时 npm 依赖） |
+| Start Command | `node packages/standalone/cli.mjs` |
+| Health Check Path | `/health` |
+| Node 版本 | 22.19.0（或在环境变量中设置 `NODE_VERSION=22.19.0`） |
+
+环境变量：
+
+| 变量 | 值 | 说明 |
+| --- | --- | --- |
+| `OFM_HOST` | `0.0.0.0` | 必须。否则只监听回环地址，Render 无法访问 |
+| `OFM_FORWARD_KEY` | 点击 Generate 生成，或自定义固定值 | 固定 API Key，重启和休眠唤醒后保持不变 |
+| `OFM_HOME` | `/tmp/our-free-model` | 可选。`RENDER=true` 时代码已默认使用该目录 |
+| `OFM_PUBLIC_URL` | `https://你的自定义域名` | 可选。使用 `onrender.com` 域名时不用设置，代码会自动读取 `RENDER_EXTERNAL_URL` |
+
+不要手动设置 `PORT` 和 `RENDER_EXTERNAL_URL`，Render 会自动注入。
+`OFM_API_KEY` 可以作为 `OFM_FORWARD_KEY` 的别名，两者设置一个即可。
+
+启动后日志会打印一次性管理登录链接
+（`https://<服务域名>/#login=…`，10 分钟内有效），用它进入控制台；
+远程部署没有本机终端，页面上的“打开终端获取令牌”按钮不会生效。
+已知固定 API Key 后，也可以在登录页直接粘贴它，不再依赖一次性链接。
+
+免费实例没有持久磁盘，以下数据在每次部署、重启或休眠唤醒后都会丢失：
+
+- 账号渠道的登录凭据（`channel-credentials.json`）和 EAC 授权，需要重新登录；
+  匿名免费通道和 Kilo 免费通道不需要凭据，不受影响。
+- 用量统计、模型隐藏设置、刷新间隔等服务设置恢复默认值。
+- 管理会话失效；启动日志会生成新的一次性登录链接。
+- 代码里的 API Key 由 `OFM_FORWARD_KEY` 提供，因此不会丢失。
+
+其他注意：
+
+- 免费实例会在无流量约 15 分钟后休眠，下一次请求需要冷启动，首个请求可能较慢。
+- 公开部署意味着任何拿到 API Key 的人都能调用推理接口；请把 Key 当作密码保管。
+  固定 Key 模式下控制台的“轮换密钥”不可用，需要在 Render 控制台修改环境变量。
+- Render 只路由一个端口，LAN 中继在 Render 上没有意义，保持关闭即可。
+
+### 远程账号授权
+
+配置了公网地址后，账号渠道的登录链接会按类型自动适配：
+
+- **本地 OAuth 回调**（CodeArts、LobsterAI、TRAE、Gemini）：登录页会先打开一个
+  “粘贴回调地址”页面。完成上游授权后，浏览器跳转到 `127.0.0.1` 会提示无法访问；
+  复制地址栏里的完整地址，粘贴回该页面提交即可。
+- **本地登录页**（Loomy、Raccoon）：登录页由服务端反向代理，直接在弹窗里扫码。
+  Raccoon 的短信登录会加载阿里云滑块；如果阿里云按 `SceneId` 做了域名白名单，
+  Render 域名可能被拒，此时请使用微信扫码。
+- **设备码/轮询**（CodeBuddy、WorkBuddy、Qoder、Qoder 中国版、Cline、MiniMax、
+  ZCode）：不需要回调，按页面提示完成授权即可。
+
+远程登录页会显示管理会话失效、CSP 拦截等诊断信息；如果页面一直停在
+“等待扫码”，请确认是否已在微信中点击确认，或改用其他登录方式。
 
 ## 当前接口与渠道
 

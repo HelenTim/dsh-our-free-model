@@ -205,17 +205,31 @@ function isLoopbackIp(ip) {
 }
 
 /**
- * Resolve the bind address for an operator who explicitly opted into a public
- * listener. Only IP literals are accepted: a hostname here would reintroduce
- * the DNS ambiguity `resolveLoopbackBind` exists to remove.
+ * Resolve the bind address for a caller that explicitly opted into a
+ * non-loopback bind (a public deployment behind a platform proxy).
  *
- * @returns {string}
+ * Loopback callers must keep using `resolveLoopbackBind`: the loopback-only
+ * rule is a security boundary, not a default. This variant exists so the
+ * standalone product can bind `0.0.0.0` when the operator asks for it, and it
+ * still refuses an empty/unresolvable host.
+ *
+ * @returns {Promise<string>} the address to pass to `server.listen`
  */
-export function resolvePublicBind(host) {
-  const value = String(host ?? '').trim() || '0.0.0.0'
+export async function resolveBindAddress(host, { allowNonLoopback = false } = {}) {
+  if (!allowNonLoopback) return resolveLoopbackBind(host)
+  const value = String(host ?? '').trim() || '127.0.0.1'
   const literal = value.replace(/^\[|\]$/g, '')
-  if (!net.isIP(literal)) throw new Error(`the public listener binds an IP literal only (got ${value})`)
-  return literal
+  if (net.isIP(literal)) return literal
+  let addresses
+  try {
+    addresses = await dns.promises.lookup(literal, { all: true, verbatim: true })
+  } catch (error) {
+    throw new Error(`could not resolve the forward bind host "${value}" (${error?.message ?? error})`)
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw new Error(`the forward bind host "${value}" resolved to no address`)
+  }
+  return addresses[0].address
 }
 
 /**
@@ -334,10 +348,10 @@ export async function bindForwardPort(server, { address, port, attempts = BIND_A
  * @param {(event: object) => void} [options.onTrace] - bounded request diagnostics, separate from warnings
  * @param {() => object} [options.health] - 健康应答由各产品入口注入，默认保持插件兼容。
  * @param {(req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>} [options.handleRequest] - 产品附加路由，返回 true 表示已处理。
- * @param {boolean} [options.bindPublic] - 显式允许绑定非回环地址（独立服务的公网部署）；默认关闭。
+ * @param {boolean} [options.allowNonLoopback] - 显式允许绑定公网地址；默认仍只接受回环地址。
  * @returns {Promise<{server: http.Server, port: number, close: () => Promise<void>}>}
  */
-export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest, bindPublic = false }) {
+export async function startForwardServer({ config, complete, modelRows, log = () => {}, onTrace = () => {}, heartbeatMs = SSE_HEARTBEAT_MS, optimize = null, health = () => ({ ok: true, service: 'our-free-model' }), handleRequest, allowNonLoopback = false }) {
   const server = http.createServer((req, res) => {
     const trace = traceRequest(req, res, 'forward', onTrace)
     void handle(req, res, trace).catch(error => {
@@ -404,9 +418,11 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
   }
 
   // Resolve before listen so a hostile hosts file cannot slip a routable bind
-  // past the loopback-only rule. The reported `host` below stays the configured
-  // spelling: the settings reconciliation compares it, not the resolved IP.
-  const bindAddress = bindPublic ? resolvePublicBind(config().host) : await resolveLoopbackBind(config().host)
+  // past the loopback-only rule. A caller that opted into `allowNonLoopback`
+  // deliberately skips that rule. The reported `host` below stays the
+  // configured spelling: the settings reconciliation compares it, not the
+  // resolved IP.
+  const bindAddress = await resolveBindAddress(config().host, { allowNonLoopback })
   const requestedPort = Number.isFinite(Number(config().port)) ? Math.trunc(Number(config().port)) : 0
   const bound = await bindForwardPort(server, { address: bindAddress, port: requestedPort, log: message => log(`bind: ${message}`) })
   server.on('error', error => log(`listener error: ${error?.message ?? error}`))

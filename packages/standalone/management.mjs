@@ -3,7 +3,6 @@ import fs from 'node:fs'
 import http from 'node:http'
 import { buildStats } from '../../src/core/stats.js'
 import { generateKey } from '../../src/forward.js'
-import { structuralRejection } from '../../src/trust.js'
 import { openLoginTerminal } from './login-terminal.mjs'
 import { publicModelVisibility, validateModelVisibility, isModelHidden } from '../../src/store.js'
 
@@ -11,6 +10,9 @@ const PREFIX = '/api/management'
 const BOOTSTRAP_MS = 10 * 60_000
 const SESSION_MS = 8 * 60 * 60_000
 const MAX_BODY_BYTES = 16 * 1024
+const REMOTE_LOGIN_MS = 15 * 60_000
+const REMOTE_PROXY_LIMIT = 1024 * 1024
+const LOOPBACK_NAMES = new Set(['127.0.0.1', '[::1]', '::1', 'localhost'])
 const ASSETS = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
 ])
@@ -30,6 +32,257 @@ function matches(actual, expected) {
   const left = Buffer.from(actual)
   const right = Buffer.from(expected)
   return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+/** Split a Host/Origin/Referer value into {scheme, hostname, port}. */
+function parseAuthority(value, defaultScheme = 'http') {
+  if (typeof value !== 'string' || value.trim() === '') return null
+  let url
+  try {
+    url = new URL(value.includes('://') ? value.trim() : `${defaultScheme}://${value.trim()}`)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  const scheme = url.protocol === 'https:' ? 'https' : 'http'
+  const port = url.port === '' ? (scheme === 'https' ? '443' : '80') : url.port
+  return { scheme, hostname: url.hostname.toLowerCase(), port }
+}
+
+function sameAuthority(left, right) {
+  return left !== null && right !== null && left.scheme === right.scheme &&
+    left.hostname === right.hostname && left.port === right.port
+}
+
+/** Behind a platform proxy the connection is plain HTTP but the page is HTTPS. */
+function requestScheme(req) {
+  const forwarded = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
+  return forwarded === 'https' ? 'https' : 'http'
+}
+
+function requestAuthority(req, { forwardedHost = false } = {}) {
+  const forwarded = forwardedHost ? String(req.headers['x-forwarded-host'] ?? '').split(',')[0].trim() : ''
+  const host = forwarded !== '' ? forwarded : req.headers.host
+  return parseAuthority(host, requestScheme(req))
+}
+
+function isLoopbackName(hostname) {
+  return LOOPBACK_NAMES.has(String(hostname ?? '').toLowerCase())
+}
+
+/**
+ * Find the local callback/page target inside a provider login URL.
+ *
+ * Callback providers put their loopback redirect in different parameters
+ * (`redirect_uri` for LobsterAI/Gemini, `auth_callback_url` for TRAE, a bare
+ * `port` for CodeArts). Loomy/Raccoon return the local page itself. A device
+ * code flow has no loopback target and needs no remote helper.
+ */
+function findLocalTarget(loginUrl) {
+  let url
+  try { url = new URL(loginUrl) } catch { return undefined }
+  if (isLoopbackName(url.hostname) && url.port !== '') {
+    return { kind: 'page', port: Number(url.port), path: url.pathname + url.search }
+  }
+  // LobsterAI keeps its login query inside the hash (`/portal#/login?...`),
+  // so inspect both the search and the fragment.
+  const hashQuery = url.hash.includes('?') ? url.hash.slice(url.hash.indexOf('?') + 1) : ''
+  const params = [url.searchParams, new URLSearchParams(hashQuery)]
+  for (const search of params) {
+    for (const key of ['redirect_uri', 'redirect', 'auth_callback_url', 'callback', 'callback_url']) {
+      const raw = search.get(key)
+      if (raw === null) continue
+      let candidate
+      try { candidate = new URL(raw) } catch { continue }
+      if (isLoopbackName(candidate.hostname) && candidate.port !== '') {
+        return { kind: 'callback', port: Number(candidate.port), path: candidate.pathname + candidate.search }
+      }
+    }
+    const port = search.get('port')
+    if (port !== null && /^\d+$/.test(port) && Number(port) > 0 && Number(port) <= 65535) {
+      return { kind: 'callback', port: Number(port), path: '/' }
+    }
+  }
+  return undefined
+}
+
+/** The pasted callback URL must point at the exact loopback port we started. */
+function localCallbackPath(value, expectedPort) {
+  let url
+  try { url = new URL(String(value ?? '').trim()) } catch { return undefined }
+  if (url.protocol !== 'http:' || url.username !== '' || url.password !== '') return undefined
+  if (!isLoopbackName(url.hostname) || url.port === '' || Number(url.port) !== expectedPort) return undefined
+  return url.pathname + url.search
+}
+
+const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[character]))
+
+async function readRawBody(req, limit = MAX_BODY_BYTES) {
+  const chunks = []
+  let bytes = 0
+  for await (const chunk of req) {
+    bytes += chunk.length
+    if (bytes > limit) throw fail(413, '请求内容过大')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+/** Ask the worker's loopback callback server to process a pasted redirect. */
+function replayLocalCallback(port, path) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1', port, path, method: 'GET', timeout: 30_000,
+    }, response => {
+      response.resume()
+      response.once('end', () => resolve({ pending: false }))
+    })
+    request.once('timeout', () => {
+      request.destroy()
+      // The handler received the request but is still exchanging the code.
+      resolve({ pending: true })
+    })
+    request.once('error', reject)
+    request.end()
+  })
+}
+
+function renderManualLoginPage(entry) {
+  const provider = entry.provider === 'codearts' ? 'CodeArts'
+    : entry.provider === 'lobsterai' ? 'LobsterAI'
+      : entry.provider === 'trae' ? 'TRAE'
+        : entry.provider === 'gemini' ? 'Gemini' : entry.provider
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(provider)} 授权</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: #f5f6f8; color: #1f2329; }
+  .card { background: #fff; border-radius: 12px; padding: 24px 28px; box-shadow: 0 4px 24px rgba(0,0,0,.08);
+          width: min(520px, calc(100vw - 32px)); box-sizing: border-box; }
+  h1 { font-size: 17px; margin: 0 0 12px; }
+  p { font-size: 13px; line-height: 1.7; color: #4e5969; margin: 0 0 10px; }
+  a { display: inline-block; margin: 4px 0 14px; padding: 9px 16px; border-radius: 8px;
+      background: #07c160; color: #fff; text-decoration: none; font-size: 14px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 84px; padding: 8px 10px; font-size: 13px;
+             border: 1px solid #d9dde3; border-radius: 8px; font-family: ui-monospace, monospace; }
+  button { margin-top: 10px; width: 100%; padding: 9px; font-size: 14px; border: 0; border-radius: 8px;
+           background: #1f2329; color: #fff; cursor: pointer; }
+  button:disabled { background: #c9cdd4; cursor: not-allowed; }
+  #status { margin-top: 10px; font-size: 13px; color: #0f9d58; min-height: 20px; }
+  #status[data-tone="err"] { color: #d93026; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>完成 ${escapeHtml(provider)} 授权</h1>
+    <p>1. 点击下面的按钮打开授权页（会在新标签页打开）。</p>
+    <a href="${escapeHtml(entry.loginUrl)}" target="_blank" rel="noreferrer noopener">打开授权页</a>
+    <p>2. 授权完成后，浏览器会跳转到 <code>127.0.0.1</code> 并提示无法访问。这是正常的。</p>
+    <p>3. 复制地址栏中的完整地址，粘贴到这里并提交。</p>
+    <textarea id="callback" placeholder="http://127.0.0.1:..."></textarea>
+    <button id="submit" type="button">提交授权地址</button>
+    <p id="status" role="status"></p>
+    <p>提交后可以关闭本页，回到控制台等待账号出现。</p>
+  </div>
+<script>
+(function () {
+  var token = ${JSON.stringify(entry.token)};
+  var status = document.getElementById('status');
+  var submit = document.getElementById('submit');
+  function setStatus(text, tone) {
+    status.textContent = text;
+    if (tone) status.setAttribute('data-tone', tone);
+    else status.removeAttribute('data-tone');
+  }
+  submit.addEventListener('click', function () {
+    var url = document.getElementById('callback').value.trim();
+    if (url === '') { setStatus('请先粘贴授权后的地址', 'err'); return; }
+    submit.disabled = true;
+    setStatus('正在提交…');
+    fetch('${PREFIX}/login/callback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, url: url })
+    }).then(function (response) {
+      return response.json().then(function (value) { return { ok: response.ok, value: value }; });
+    }).then(function (result) {
+      if (!result.ok) { setStatus(result.value.error || '提交失败', 'err'); return; }
+      setStatus(result.value.pending === true
+        ? '已提交，服务端仍在等待渠道确认；稍后回到控制台查看。'
+        : '已提交，正在等待渠道确认；稍后回到控制台查看。');
+    }).catch(function (error) {
+      setStatus('提交失败：' + (error && error.message ? error.message : error), 'err');
+    }).finally(function () { submit.disabled = false; });
+  });
+})();
+</script>
+</body>
+</html>`
+}
+
+/** Local login pages use root-absolute fetches; move them under the proxy token. */
+function rewriteProxiedHtml(html, entry) {
+  const prefix = `${PREFIX}/login/page/${entry.token}`
+  const bases = entry.provider === 'loomy' ? ['/wechat/'] : entry.provider === 'raccoon' ? ['/raccoon/'] : []
+  let output = html
+  for (const base of bases) {
+    output = output.split(`"${base}`).join(`"${prefix}${base}`)
+    output = output.split(`'${base}`).join(`'${prefix}${base}`)
+  }
+  if (entry.provider === 'raccoon') {
+    // The local page silently swallows fetch failures; surface an expired
+    // management session instead of leaving the user on "等待扫码…".
+    output = output.replace('<body>', `<body>
+<div style="margin:0;padding:8px 12px;background:#eef6ff;color:#1d4f91;font-size:12px;text-align:center">扫码后请在微信中确认登录；若一直停留在“等待扫码”，可改用短信登录。</div>
+<script>
+(function () {
+  document.addEventListener('securitypolicyviolation', function (event) {
+    var target = document.getElementById('smsStatus');
+    if (!target) return;
+    target.textContent = '验证码组件被 CSP 拦截：' + (event.blockedURI || event.violatedDirective || 'unknown');
+    target.setAttribute('data-tone', 'err');
+  });
+  var original = window.fetch;
+  window.fetch = function (input, init) {
+    return original(input, init).then(function (response) {
+      if (response.status === 401 || response.status === 403) {
+        var targets = [document.getElementById('qrStatus'), document.getElementById('smsStatus')];
+        targets.forEach(function (target) {
+          if (!target) return;
+          target.textContent = '管理会话已失效，请关闭窗口并重新登录';
+          target.setAttribute('data-tone', 'err');
+        });
+      }
+      return response;
+    });
+  };
+})();
+</script>`)
+  }
+  return output
+}
+
+const LOGIN_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+// Raccoon's SMS tab loads the Aliyun slider captcha. Its script, API calls and
+// iframe all live on Alibaba's CDNs, so this one proxied page gets a wider CSP
+// than the management console. The QR tab does not need any of it.
+const RACCOON_LOGIN_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline' https://*.alicdn.com https://o.alicdn.com; script-src 'unsafe-inline' 'unsafe-eval' https://*.alicdn.com https://o.alicdn.com; connect-src 'self' https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; img-src 'self' data: blob: https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; frame-src 'self' blob: https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; font-src 'self' data: https://*.alicdn.com https://o.alicdn.com; worker-src 'self' blob:; form-action 'self' https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; frame-ancestors 'none'; base-uri 'none'"
+
+function loginPageHeaders(provider) {
+  return {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': provider === 'raccoon' ? RACCOON_LOGIN_PAGE_CSP : LOGIN_PAGE_CSP,
+  }
 }
 
 async function readBody(req, limit = MAX_BODY_BYTES) {
@@ -82,22 +335,46 @@ export function managementSettings(value) {
 }
 
 /** 管理读写要求鉴权；登录恢复仅允许同源页面触发固定本机动作。 */
-export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicOrigin = null, publicMode = false }) {
-  const publicHttps = publicOrigin?.protocol === 'https:'
-  const cookieFlags = `HttpOnly; SameSite=Strict${publicHttps ? '; Secure' : ''}`
-  // 登录弹窗页（/raccoon/*、/wechat/*）由渠道在回环端口上渲染、经主监听器转发，
-  // 不在 /api/management 之下；Cookie 必须覆盖全站，弹窗与页内轮询才带得上会话。
-  const cookiePath = '/'
-  const expectedOrigin = req => {
-    if (publicOrigin !== null) return new URL(`${publicHttps ? 'https' : 'http'}://${req.headers.host}`).origin
-    if (publicMode) {
-      const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
-      return new URL(`${proto === 'https' ? 'https' : 'http'}://${req.headers.host}`).origin
-    }
-    return new URL(`http://${req.headers.host}`).origin
-  }
+export function createManagement({ stores, runtime, channels, eac, info, onSettingsChanged, loginTerminal = openLoginTerminal, publicUrl, remoteAccess = false, keyFromEnv = false }) {
   let bootstrap = { token: crypto.randomBytes(32).toString('base64url'), until: Date.now() + BOOTSTRAP_MS }
   const sessions = new Map()
+  // A public deployment names the one origin it is reachable at; the fence
+  // then accepts that authority in addition to loopback. Without it, only
+  // loopback hostnames are trusted, exactly as before.
+  const publicAuthority = publicUrl === undefined ? null : parseAuthority(publicUrl, 'https')
+  // Pending channel logins whose loopback callback/page lives on this host.
+  // The public deployment cannot reach the user's own 127.0.0.1, so the
+  // login URL is rewritten to a management route and the callback is either
+  // proxied (local login pages) or replayed from a pasted URL (OAuth).
+  const remoteLogins = new Map()
+  const remoteLoginEnabled = publicUrl !== undefined
+  const pruneRemoteLogins = () => {
+    for (const [token, entry] of remoteLogins) if (entry.expiresAt <= Date.now()) remoteLogins.delete(token)
+  }
+  const findRemoteLogin = token => {
+    pruneRemoteLogins()
+    return remoteLogins.get(token)
+  }
+  const registerRemoteLogin = (result, payload) => {
+    if (!remoteLoginEnabled || result?.ok !== true || result.value === undefined) return
+    const loginUrl = result.value.loginUrl
+    if (typeof loginUrl !== 'string' || loginUrl === '') return
+    const target = findLocalTarget(loginUrl)
+    if (target === undefined) return
+    const token = crypto.randomBytes(24).toString('base64url')
+    const entry = {
+      token, provider: String(payload?.provider ?? ''), kind: target.kind,
+      port: target.port, loginUrl, expiresAt: Date.now() + REMOTE_LOGIN_MS,
+    }
+    remoteLogins.set(token, entry)
+    const base = info().baseUrl.replace(/\/+$/, '')
+    if (target.kind === 'page') {
+      const original = new URL(loginUrl)
+      result.value.loginUrl = `${base}${PREFIX}/login/page/${token}${original.pathname}${original.search}`
+    } else {
+      result.value.loginUrl = `${base}${PREFIX}/login/manual/${token}`
+    }
+  }
   let cookieName
   let closed = false
   let terminalOpening = false
@@ -122,49 +399,11 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8', ...headers })
     res.end(JSON.stringify(payload))
   }
-  const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'])
-  /**
-   * 转发渠道登录页。Raccoon / Loomy 的二维码页由渠道在服务端临时起的回环服务
-   * 渲染，公网部署时浏览器够不着那个随机端口，只能经主监听器按已登记的前缀转发。
-   * 该页面能完成一次账号登录，所以必须已登录管理页；会话 Cookie 是 host-only
-   * 且 SameSite=Strict，跨站请求带不上，鉴权本身就挡住了 CSRF。
-   */
-  const proxyLoginPage = (req, res, port) => new Promise(resolve => {
-    const headers = {}
-    for (const [name, value] of Object.entries(req.headers)) {
-      if (!HOP_BY_HOP.has(name) && name !== 'host') headers[name] = value
-    }
-    const upstream = http.request({ host: '127.0.0.1', port, path: req.url, method: req.method, headers }, answer => {
-      const out = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
-      for (const [name, value] of Object.entries(answer.headers)) {
-        if (!HOP_BY_HOP.has(name)) out[name] = value
-      }
-      res.writeHead(answer.statusCode ?? 502, out)
-      answer.pipe(res)
-      answer.on('end', resolve)
-    })
-    upstream.setTimeout(30_000, () => upstream.destroy(new Error('登录页响应超时')))
-    upstream.on('error', () => {
-      if (!res.destroyed && !res.headersSent) json(res, 502, { error: '登录页面已关闭，请重新发起登录' })
-      else res.destroy()
-      resolve()
-    })
-    res.once('close', () => upstream.destroy())
-    req.pipe(upstream)
-  })
-  // 同名 Cookie 可能同时存在多条（例如旧版本 Path=/api/management 的那条），
-  // 浏览器按路径长度排序，只读第一条会把过期会话当成未登录，因此逐个检查。
-  const cookieValues = req => {
-    const name = `${cookieName}=`
-    return String(req.headers.cookie ?? '').split(';')
-      .map(value => value.trim())
-      .filter(value => value.startsWith(name))
-      .map(value => value.slice(name.length))
+  const cookie = req => {
+    const parts = String(req.headers.cookie ?? '').split(';')
+    return parts.map(value => value.trim()).find(value => value.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1)
   }
-  const clearCookie = () => [
-    `${cookieName}=; Path=${cookiePath}; ${cookieFlags}; Max-Age=0`,
-    `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`,
-  ]
+  const clearCookie = req => `${cookieName}=; Path=${PREFIX}; HttpOnly; SameSite=Strict; Max-Age=0${requestScheme(req) === 'https' ? '; Secure' : ''}`
   const pruneSessions = () => {
     for (const [id, until] of sessions) if (until <= Date.now()) sessions.delete(id)
   }
@@ -172,8 +411,45 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     const bearer = /^Bearer (.+)$/i.exec(String(req.headers.authorization ?? ''))?.[1]
     if (matches(bearer, stores.settings.get().forwardKey)) return true
     pruneSessions()
-    return cookieValues(req).some(id => sessions.has(id))
+    return sessions.has(cookie(req))
   }
+  const authorityRejection = req => {
+    // Only a deployment that declared a public origin is assumed to sit behind
+    // a proxy, so only then is `x-forwarded-host` allowed to name the authority.
+    const authority = requestAuthority(req, { forwardedHost: publicAuthority !== null })
+    if (authority === null) return 'host-invalid'
+    const allowed = LOOPBACK_NAMES.has(authority.hostname) || sameAuthority(authority, publicAuthority)
+    return allowed ? undefined : 'host-not-allowed'
+  }
+  /**
+   * Host/Origin fence for the API surface. Loopback remains trusted for local
+   * use; a configured public URL is the only additional authority accepted, so
+   * a DNS-rebinding or cross-site caller cannot reach management data through
+   * another Host. The scheme is read from `x-forwarded-proto` because a
+   * platform proxy terminates TLS in front of this plain-HTTP listener.
+   *
+   * Static assets use only `authorityRejection`: a top-level navigation from
+   * another site carries a cross-site `Sec-Fetch-Site` and an external
+   * `Referer`, and serving the login page there changes no state.
+   */
+  const trustRejection = req => {
+    const hostReason = authorityRejection(req)
+    if (hostReason !== undefined) return hostReason
+    if (String(req.headers['sec-fetch-site'] ?? '').toLowerCase() === 'cross-site') return 'cross-site'
+    for (const header of ['origin', 'referer']) {
+      const raw = req.headers[header]
+      if (typeof raw !== 'string' || raw.trim() === '') continue
+      const parsed = parseAuthority(raw, 'http')
+      if (parsed === null) return `${header}-invalid`
+      if (!sameAuthority(parsed, requestAuthority(req, { forwardedHost: publicAuthority !== null })) &&
+          !sameAuthority(parsed, publicAuthority)) return `${header}-mismatch`
+    }
+    return undefined
+  }
+  const sameOrigin = req => sameAuthority(
+    requestAuthority(req, { forwardedHost: publicAuthority !== null }),
+    parseAuthority(req.headers.origin, 'http'),
+  )
   const persist = patch => {
     const previous = stores.settings.get()
     stores.settings.update(patch)
@@ -184,12 +460,12 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       throw fail(500, '无法保存设置，请检查数据目录权限和磁盘空间')
     }
   }
-  const summary = req => {
+  const summary = () => {
     const state = runtime.state()
     const available = stores.availability.get()
     const routable = new Set(runtime.publicModelRows().map(entry => entry.id))
     return {
-      ...info(req),
+      ...info(),
       channels: channels?.state(),
       eacAuth: eac?.cached(),
       settings: managementSettings(stores.settings.get()),
@@ -212,8 +488,9 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     const method = req.method ?? 'GET'
     if (method === 'POST' && pathname === `${PREFIX}/login/terminal`) {
       // 此入口发生在登录前，必须有浏览器的同源 Origin，拒绝跨站和无来源调用。
-      if (req.headers.origin !== expectedOrigin(req) ||
-          req.headers['sec-fetch-site'] !== 'same-origin') {
+      // 远程部署没有可打开的本机终端，令牌只能来自启动日志中的一次性链接。
+      if (remoteAccess) throw fail(400, '远程部署不支持自动获取令牌，请使用启动日志中的一次性登录链接')
+      if (!sameOrigin(req) || req.headers['sec-fetch-site'] !== 'same-origin') {
         throw fail(403, '请从本机登录页面点击获取令牌')
       }
       const body = await readBody(req)
@@ -239,48 +516,107 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const id = crypto.randomBytes(32).toString('base64url')
       sessions.set(id, Date.now() + SESSION_MS)
       json(res, 200, { ok: true }, {
-        'set-cookie': [
-          `${cookieName}=${id}; Path=${cookiePath}; ${cookieFlags}; Max-Age=${SESSION_MS / 1000}`,
-          `${cookieName}=; Path=${PREFIX}; ${cookieFlags}; Max-Age=0`,
-        ],
+        'set-cookie': `${cookieName}=${id}; Path=${PREFIX}; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MS / 1000}${requestScheme(req) === 'https' ? '; Secure' : ''}`,
       })
       return
     }
     if (!authenticated(req)) throw fail(401, '请先登录管理页面')
     if (method === 'POST' && pathname === `${PREFIX}/logout`) {
       await readBody(req)
-      for (const id of cookieValues(req)) sessions.delete(id)
-      json(res, 200, { ok: true }, { 'set-cookie': clearCookie() })
+      sessions.delete(cookie(req))
+      json(res, 200, { ok: true }, { 'set-cookie': clearCookie(req) })
     } else if (method === 'GET' && pathname === `${PREFIX}/summary`) {
-      json(res, 200, summary(req))
+      json(res, 200, summary())
     } else if (method === 'GET' && pathname === `${PREFIX}/stats`) {
       json(res, 200, buildStats(stores.stats.get(), runtime.catalog))
+    } else if (method === 'POST' && pathname === `${PREFIX}/login/callback`) {
+      const body = await readBody(req)
+      const entry = findRemoteLogin(body.token)
+      if (entry === undefined || entry.kind !== 'callback') throw fail(404, '授权会话不存在或已过期')
+      const targetPath = localCallbackPath(body.url, entry.port)
+      if (targetPath === undefined) throw fail(400, '地址不是本次授权流程的回调地址')
+      const outcome = await replayLocalCallback(entry.port, targetPath)
+        .catch(() => { throw fail(502, '无法连接本机回调服务，授权可能已超时') })
+      remoteLogins.delete(entry.token)
+      json(res, 200, { ok: true, pending: outcome.pending })
+    } else if (method === 'GET' && pathname.startsWith(`${PREFIX}/login/manual/`)) {
+      const entry = findRemoteLogin(pathname.slice(`${PREFIX}/login/manual/`.length))
+      if (entry === undefined || entry.kind !== 'callback') throw fail(404, '授权会话不存在或已过期')
+      res.writeHead(200, { ...loginPageHeaders(entry.provider), 'content-type': 'text/html; charset=utf-8' })
+      res.end(renderManualLoginPage(entry))
+    } else if (pathname.startsWith(`${PREFIX}/login/page/`)) {
+      const rest = pathname.slice(`${PREFIX}/login/page/`.length)
+      const slash = rest.indexOf('/')
+      const token = slash === -1 ? rest : rest.slice(0, slash)
+      const localPath = slash === -1 ? '/' : rest.slice(slash)
+      const entry = findRemoteLogin(token)
+      if (entry === undefined || entry.kind !== 'page') throw fail(404, '授权页面不存在或已过期')
+      const allowed = entry.provider === 'loomy' ? '/wechat/' : entry.provider === 'raccoon' ? '/raccoon/' : '/'
+      if (!localPath.startsWith(allowed) || /(^|\/)\.\.?(\/|$)|%2e/i.test(localPath)) throw fail(404, '授权页面路径无效')
+      if (!['GET', 'POST', 'HEAD'].includes(method)) throw fail(405, '授权页面只支持 GET、POST 或 HEAD')
+      const search = new URL(req.url ?? '/', 'http://localhost').search
+      const body = method === 'POST' ? await readRawBody(req, 64 * 1024) : undefined
+      const upstream = await new Promise((resolve, reject) => {
+        const request = http.request({
+          host: '127.0.0.1', port: entry.port, path: `${localPath}${search}`, method, timeout: 40_000,
+          headers: {
+            ...method === 'POST' && typeof req.headers['content-type'] === 'string'
+              ? { 'content-type': req.headers['content-type'] } : {},
+            ...body === undefined ? {} : { 'content-length': String(body.length) },
+          },
+        }, response => {
+          const chunks = []
+          let bytes = 0
+          response.on('data', chunk => {
+            bytes += chunk.length
+            if (bytes <= REMOTE_PROXY_LIMIT) chunks.push(chunk)
+          })
+          response.once('end', () => resolve({
+            status: response.statusCode ?? 502,
+            type: String(response.headers['content-type'] ?? 'application/octet-stream'),
+            body: Buffer.concat(chunks),
+          }))
+        })
+        request.once('timeout', () => { request.destroy(new Error('timeout')) })
+        request.once('error', reject)
+        request.end(body)
+      }).catch(() => { throw fail(502, '无法连接本机登录页，授权可能已超时') })
+      if (upstream.type.toLowerCase().includes('text/html')) {
+        res.writeHead(upstream.status, { ...loginPageHeaders(entry.provider), 'content-type': 'text/html; charset=utf-8' })
+        res.end(rewriteProxiedHtml(upstream.body.toString('utf8'), entry))
+      } else {
+        res.writeHead(upstream.status, {
+          'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+          'referrer-policy': 'no-referrer', 'content-type': upstream.type,
+        })
+        res.end(upstream.body)
+      }
     } else if (method === 'POST' && pathname === `${PREFIX}/channels/rpc` && channels) {
       // 渠道备份导入包含多账号凭据，仍限制总大小，但不能套设置表单的 16KB。
       const body = await readBody(req, 8 * 1024 * 1024)
-      if (body.method === 'login.callback') {
-        // 本机回环回调型登录（CodeArts / LobsterAI / TRAE / Gemini）：
-        // 浏览器打不开 127.0.0.1 上的回调，用户把地址栏里那条链接粘贴回来。
-        json(res, 200, { ok: true, value: await channels.relayLoginCallback(body.payload) })
-      } else if (body.method === 'gateway.getEnabled' || body.method === 'gateway.setEnabled') {
+      if (body.method === 'gateway.getEnabled' || body.method === 'gateway.setEnabled') {
         if (body.method === 'gateway.setEnabled') {
           if (typeof body.payload?.enabled !== 'boolean') throw fail(400, 'enabled 必须是布尔值')
           persist({ enabled: body.payload.enabled })
           await onSettingsChanged()
         }
-        const base = new URL(info(req).baseUrl)
+        const base = new URL(info().baseUrl)
+        const port = base.port === '' ? (base.protocol === 'https:' ? 443 : 80) : Number(base.port)
         json(res, 200, { ok: true, value: {
           enabled: stores.settings.get().enabled !== false, running: stores.settings.get().enabled !== false,
-          blockedByEnv: false, address: { host: base.hostname, port: Number(base.port || (base.protocol === 'https:' ? 443 : 80)) },
-          apiKey: { value: stores.settings.get().forwardKey, path: `${info().dataDir}/settings.json`, fromEnv: false },
+          blockedByEnv: false, address: { host: base.hostname, port },
+          apiKey: { value: stores.settings.get().forwardKey, path: `${info().dataDir}/settings.json`, fromEnv: keyFromEnv },
           models: runtime.publicModelRows(), modelsSource: 'catalog',
         } })
       } else {
         const controller = new AbortController()
         const abort = () => controller.abort()
         res.once('close', abort)
-        try { json(res, 200, await channels.rpc(body, controller.signal, info(req).baseUrl)) }
-        finally { res.removeListener('close', abort) }
+        try {
+          const result = await channels.rpc(body, controller.signal)
+          if (body.method === 'account.create') registerRemoteLogin(result, body.payload)
+          json(res, 200, result)
+        } finally { res.removeListener('close', abort) }
       }
     } else if (eac && pathname.startsWith(`${PREFIX}/eac/`)) {
       const params = new URL(req.url, 'http://localhost').searchParams
@@ -314,20 +650,24 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     } else if (method === 'GET' && pathname === `${PREFIX}/key`) {
       json(res, 200, { key: stores.settings.get().forwardKey })
     } else if (method === 'POST' && pathname === `${PREFIX}/key/rotate`) {
+      // A platform-managed key is authoritative across restarts; rotating it in
+      // memory would silently revert on the next deploy.
+      if (keyFromEnv) throw fail(400, 'API Key 由环境变量管理，请在部署平台修改 OFM_FORWARD_KEY 后重新部署')
       const body = await readBody(req)
       if (body.confirm !== true) throw fail(400, '请确认轮换 API Key')
-      const kept = cookieValues(req).map(id => [id, sessions.get(id)]).filter(([, until]) => until !== undefined)
+      const id = cookie(req)
       persist({ forwardKey: generateKey() })
       // 仅当前管理会话保留；旧密钥与其他会话立即失效。
+      const until = sessions.get(id)
       sessions.clear()
-      for (const [id, until] of kept) sessions.set(id, until)
+      if (until) sessions.set(id, until)
       bootstrap = null
       json(res, 200, { key: stores.settings.get().forwardKey })
     } else if (method === 'POST' && pathname === `${PREFIX}/models/refresh`) {
       const body = await readBody(req)
       if (body.probe !== undefined && typeof body.probe !== 'boolean') throw fail(400, 'probe 必须是布尔值')
       await runtime.refreshCatalog({ probe: body.probe === true, force: body.probe === true })
-      json(res, 200, summary(req))
+      json(res, 200, summary())
     } else if (method === 'POST' && pathname === `${PREFIX}/models/test`) {
       const body = await readBody(req)
       if (stores.settings.get().enabled === false) throw fail(503, '推理服务已暂停，请先在服务设置中启用')
@@ -359,39 +699,17 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
       const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
       const asset = assets.get(pathname)
       const isApi = pathname === PREFIX || pathname.startsWith(`${PREFIX}/`)
-      const loginPage = !asset && !isApi ? channels?.loginTarget?.(pathname) : undefined
-      if (!asset && !isApi && loginPage === undefined) return false
-      // 不接受插件专用 dsh-app Referer；独立管理只允许本页面的 HTTP(S) 来源。
-      const referer = req.headers.referer
-      const origin = req.headers.origin
-      const malformedSource = [referer, origin].some(value => value !== undefined && (
-        typeof value !== 'string' || !/^https?:\/\//i.test(value)
-      ))
+      if (!asset && !isApi) return false
       if (closed || !cookieName) json(res, 503, { error: '服务正在停止或启动' })
-      // 登录页与静态资源不含任何凭据，从任意来源打开都安全；跨站链接的顶层
-      // 导航会带 Sec-Fetch-Site: cross-site，不能因此把登录页挡在门外。
-      // 同源围栏只保护管理 API。
+      else if ((asset === undefined ? trustRejection(req) : authorityRejection(req)) !== undefined) {
+        json(res, 403, { error: '管理接口仅允许同源访问' })
+      }
       else if (asset) {
         if (req.method !== 'GET' && req.method !== 'HEAD') json(res, 405, { error: '资源仅支持 GET 或 HEAD' })
         else {
           res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': asset.type })
           res.end(req.method === 'HEAD' ? undefined : asset.body)
         }
-      } else if (loginPage !== undefined) {
-        // 登录弹窗由管理页 window.open 打开，Cookie 已随同源导航送达；
-        // 这里不再套 Origin 围栏（弹窗可能带 about:blank Referer），
-        // 以 host-only 会话 Cookie 作为唯一判据。
-        if (!authenticated(req)) {
-          // 旧会话的 Cookie 只覆盖 /api/management，弹窗带不上；把弹窗送回管理页，
-          // 重新登录后新的全站 Cookie 才会随弹窗与页内轮询发送。
-          res.writeHead(302, { ...SECURITY_HEADERS, location: '/' })
-          res.end()
-        } else await proxyLoginPage(req, res, loginPage.port)
-      } else if (malformedSource ||
-        structuralRejection(req, {
-          allowPublic: publicMode, trustProxy: publicMode, publicHostname: publicOrigin?.hostname,
-        }) !== undefined) {
-        json(res, 403, { error: '管理接口仅允许同源访问' })
       } else {
         try { await route(req, res, pathname) } catch (error) {
           if (!res.destroyed && !res.headersSent) json(res, error.statusCode ?? 500, {

@@ -8,9 +8,6 @@ import type { Summary } from '../types'
 interface Status { closed?: boolean; accounts?: { total: number; enabled: number }; models?: { total: number; disabled: number } }
 type Rpc = (method: string, payload?: object) => Promise<any>
 const t = Object.assign((key: string) => shared.DICT.zh[key] ?? key, { locale: 'zh' })
-// 这几家的授权回调固定指向 127.0.0.1，公网部署时浏览器够不着，
-// 需要用户把地址栏里那条失败的链接粘贴回来，由服务端转发给回环回调服务。
-const LOOPBACK_CALLBACK_PROVIDERS = new Set(['codearts', 'lobsterai', 'trae', 'gemini'])
 
 export function ChannelBrowser({ rpc, summary }: { rpc: Rpc; summary: Summary & { reload?(): void } }) {
   const [statuses, setStatuses] = useState<Record<string, Status>>()
@@ -20,10 +17,6 @@ export function ChannelBrowser({ rpc, summary }: { rpc: Rpc; summary: Summary & 
   const [selected, select] = useState<string>()
   const [auto, setAuto] = useState<{ enabled: boolean; running?: boolean; ranToday?: boolean }>()
   const [busy, setBusy] = useState(false)
-  const [relay, setRelay] = useState<{ accountId: string; provider: string }>()
-  const [relayUrl, setRelayUrl] = useState('')
-  const [relayNote, setRelayNote] = useState('')
-  const [relayBusy, setRelayBusy] = useState(false)
   const mounted = useRef(false)
   const sequence = useRef(0)
   const detailHeading = useRef<HTMLHeadingElement>(null)
@@ -48,9 +41,6 @@ export function ChannelBrowser({ rpc, summary }: { rpc: Rpc; summary: Summary & 
     return () => { mounted.current = false; sequence.current++; clearInterval(timer) }
   }, [rpc, reload])
   useEffect(() => {
-    setRelay(undefined)
-    setRelayUrl('')
-    setRelayNote('')
     if (selected) {
       window.scrollTo({ top: 0, behavior: 'instant' })
       detailHeading.current?.focus({ preventScroll: true })
@@ -62,16 +52,6 @@ export function ChannelBrowser({ rpc, summary }: { rpc: Rpc; summary: Summary & 
     summary.reload?.()
   }, [reload, summary.reload])
   const onError = useCallback((_provider: unknown, failure: Error) => { if (mounted.current) setError(failure.message) }, [])
-  // 登录发起后记住账号，供「粘贴回调地址」面板回传；其它请求原样透传。
-  const cardRpc = useCallback(async (method: string, payload: any = {}) => {
-    const value = await rpc(method, payload)
-    if (method === 'account.create' && value?.accountId && LOOPBACK_CALLBACK_PROVIDERS.has(payload.provider)) {
-      setRelay({ accountId: value.accountId, provider: payload.provider })
-      setRelayUrl('')
-      setRelayNote('')
-    }
-    return value
-  }, [rpc])
   const connected = providers.filter(provider => statuses?.[provider.id]?.accounts?.enabled && !statuses[provider.id].closed).length
   const accounts = Object.values(statuses ?? {}).reduce((sum, row) => sum + (row.accounts?.total ?? 0), 0)
   const selectedProvider = providers.find(row => row.id === selected)
@@ -115,24 +95,7 @@ export function ChannelBrowser({ rpc, summary }: { rpc: Rpc; summary: Summary & 
         <div className="detail-label">切换渠道</div>{providers.map(provider => <button className={`detail-provider-link ${provider.id === selected ? 'active' : ''}`} key={provider.id}
           onClick={() => select(provider.id)}><span>{provider.name}</span>{provider.id === selected && <Check size={14} />}</button>)}</Card>
         <div className="provider-detail-main"><div className="provider-detail-description"><h2>账号与模型</h2><p>添加账号，管理免费额度与可用模型。</p></div>
-          <shared.ChannelCard key={selectedProvider.id} channel={selectedProvider} status={statuses?.[selectedProvider.id]} rpc={cardRpc} t={t} onChanged={onChanged} onError={onError} />
-          {relay && relay.provider === selectedProvider.id && <div className="callback-relay" role="group" aria-label="粘贴回调地址">
-            <h3>授权后把浏览器地址栏的链接粘贴到这里</h3>
-            <p>这个渠道的授权回调固定指向 127.0.0.1，公网部署时浏览器打不开。复制地址栏里那条以 <code>http://127.0.0.1</code> 开头的完整链接，粘贴到下面即可完成登录。</p>
-            <div className="callback-relay-row">
-              <Input aria-label="回调地址" placeholder="http://127.0.0.1:..." value={relayUrl}
-                onChange={event => setRelayUrl(event.target.value)} />
-              <Button variant="outline" busy={relayBusy} disabled={!relayUrl.trim()} onClick={() => {
-                setRelayBusy(true)
-                setRelayNote('')
-                void rpc('login.callback', { accountId: relay.accountId, url: relayUrl.trim() })
-                  .then(value => { setRelayNote(`已提交回调（HTTP ${value.status}），账号稍后会自动出现。`); onChanged() })
-                  .catch(failure => setRelayNote((failure as Error).message))
-                  .finally(() => setRelayBusy(false))
-              }}>提交回调地址</Button>
-            </div>
-            {relayNote && <p role="status" className="callback-relay-note">{relayNote}</p>}
-          </div>}
+          <shared.ChannelCard key={selectedProvider.id} channel={selectedProvider} status={statuses?.[selectedProvider.id]} rpc={rpc} t={t} onChanged={onChanged} onError={onError} />
           <div className="detail-security-note"><ShieldCheck size={16} />沿用原渠道的登录、续期与额度规则。账号备份和供应商设置位于「供应商与备份」。</div>
         </div></div>
     </div> : <>
